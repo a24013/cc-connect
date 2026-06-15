@@ -2373,6 +2373,23 @@ func (e *Engine) initPlatformCapabilities(p Platform) {
 	}
 }
 
+// RefreshPlatformCapabilities re-publishes platform capabilities that can change
+// at runtime, such as custom command menus after a config reload.
+func (e *Engine) RefreshPlatformCapabilities() {
+	e.platformLifecycleMu.Lock()
+	var ready []Platform
+	for p, ok := range e.platformReady {
+		if ok {
+			ready = append(ready, p)
+		}
+	}
+	e.platformLifecycleMu.Unlock()
+
+	for _, p := range ready {
+		e.initPlatformCapabilities(p)
+	}
+}
+
 // matchBannedWord returns the first banned word found in content, or "".
 func (e *Engine) matchBannedWord(content string) string {
 	e.bannedMu.RLock()

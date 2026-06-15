@@ -944,6 +944,39 @@ func TestEngine_LifecycleCallbacksIgnoredAfterStopBegins(t *testing.T) {
 	}
 }
 
+func TestEngine_RefreshPlatformCapabilitiesRepublishesCommands(t *testing.T) {
+	p := &stubLifecyclePlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.AddCommand("first", "first command", "", "", "", "test")
+
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer e.Stop()
+
+	e.OnPlatformReady(p)
+	if p.registerCalls != 1 {
+		t.Fatalf("registerCalls after ready = %d, want 1", p.registerCalls)
+	}
+
+	e.AddCommand("second", "second command", "", "", "", "test")
+	e.RefreshPlatformCapabilities()
+
+	if p.registerCalls != 2 {
+		t.Fatalf("registerCalls after refresh = %d, want 2", p.registerCalls)
+	}
+	var found bool
+	for _, cmd := range p.registeredCommands {
+		if cmd.Command == "second" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("refreshed command menu missing second command: %+v", p.registeredCommands)
+	}
+}
+
 func TestEngine_StopDoesNotWaitForBlockedPlatformCapabilityInit(t *testing.T) {
 	p := newBlockingRegisterPlatform("telegram")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
