@@ -3,6 +3,7 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -132,6 +133,8 @@ const (
 	initialReconnectBackoff = time.Second
 	maxReconnectBackoff     = 30 * time.Second
 	stableConnectionWindow  = 10 * time.Second
+	telegramFileRetries     = 3
+	telegramFileRetryDelay  = 500 * time.Millisecond
 )
 
 func New(opts map[string]any) (core.Platform, error) {
@@ -145,7 +148,7 @@ func New(opts map[string]any) (core.Platform, error) {
 	// Build HTTP client with optional proxy support.
 	// Timeout must exceed the server-side long-poll duration (pollTimeout − 1s = 59s)
 	// to avoid the HTTP client racing with Telegram's response. 90s gives 30s headroom.
-	httpClient := &http.Client{Timeout: 90 * time.Second}
+	transport := telegramHTTPTransport(nil)
 	if proxyURL, _ := opts["proxy"].(string); proxyURL != "" {
 		u, err := url.Parse(proxyURL)
 		if err != nil {
@@ -156,9 +159,10 @@ func New(opts map[string]any) (core.Platform, error) {
 		if proxyUser != "" {
 			u.User = url.UserPassword(proxyUser, proxyPass)
 		}
-		httpClient.Transport = &http.Transport{Proxy: http.ProxyURL(u)}
+		transport.Proxy = http.ProxyURL(u)
 		slog.Info("telegram: using proxy", "proxy", u.Host, "auth", proxyUser != "")
 	}
+	httpClient := &http.Client{Timeout: 90 * time.Second, Transport: transport}
 
 	groupReplyAll, _ := opts["group_reply_all"].(bool)
 	shareSessionInChannel, _ := opts["share_session_in_channel"].(bool)
@@ -191,6 +195,17 @@ func New(opts map[string]any) (core.Platform, error) {
 		progressStyle:         progressStyle,
 		httpClient:            httpClient,
 	}, nil
+}
+
+func telegramHTTPTransport(proxy func(*http.Request) (*url.URL, error)) *http.Transport {
+	return &http.Transport{
+		Proxy:               proxy,
+		ForceAttemptHTTP2:   false,
+		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{},
+		MaxIdleConns:        20,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     30 * time.Second,
+	}
 }
 
 func (p *Platform) Name() string { return "telegram" }
@@ -455,19 +470,25 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 
 	if len(msg.Photo) > 0 {
 		best := msg.Photo[len(msg.Photo)-1]
+		caption := stripBotMention(msg.Caption, botName)
 		imgData, err := p.downloadFile(best.FileID)
+		images := []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}}
 		if err != nil {
 			slog.Error("telegram: download photo failed", "error", err)
-			return
+			images = nil
+			if caption == "" {
+				caption = "[Telegram image download failed; no caption text was provided.]"
+			} else {
+				caption += "\n\n[Telegram image download failed.]"
+			}
 		}
-		caption := stripBotMention(msg.Caption, botName)
 		p.dispatchMessage(&core.Message{
 			SessionKey: sessionKey, Platform: "telegram",
 			UserID: userID, UserName: userName, ChatName: chatName,
 			Content:    caption,
 			MessageID:  strconv.Itoa(msg.ID),
 			ChannelKey: channelKey,
-			Images:     []core.ImageAttachment{{MimeType: "image/jpeg", Data: imgData}},
+			Images:     images,
 			ReplyCtx:   rctx,
 		}, msg)
 		return
@@ -1347,6 +1368,24 @@ func (p *Platform) downloadFile(fileID string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	var lastErr error
+	for attempt := 1; attempt <= telegramFileRetries; attempt++ {
+		data, err := p.downloadFileOnce(bot, fileID)
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		if transport, ok := p.httpClient.Transport.(*http.Transport); ok {
+			transport.CloseIdleConnections()
+		}
+		if attempt < telegramFileRetries {
+			time.Sleep(telegramFileRetryDelay * time.Duration(attempt))
+		}
+	}
+	return nil, lastErr
+}
+
+func (p *Platform) downloadFileOnce(bot telegramBot, fileID string) ([]byte, error) {
 	ctx := context.Background()
 	f, err := bot.GetFile(ctx, &tgbot.GetFileParams{FileID: fileID})
 	if err != nil {
@@ -1357,7 +1396,12 @@ func (p *Platform) downloadFile(fileID string) ([]byte, error) {
 	}
 	link := bot.FileDownloadLink(f)
 
-	resp, err := p.httpClient.Get(link)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, link, nil)
+	if err != nil {
+		return nil, fmt.Errorf("download file %s: %w", fileID, err)
+	}
+	req.Close = true
+	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("download file %s: %w", fileID, err)
 	}

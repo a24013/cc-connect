@@ -86,6 +86,7 @@ type stubTelegramBot struct {
 	sendErr    error
 	getFileErr error
 	file       *models.File
+	fileURL    string
 }
 
 func newStubTelegramBot() *stubTelegramBot {
@@ -202,6 +203,9 @@ func (b *stubTelegramBot) GetFile(_ context.Context, _ *tgbot.GetFileParams) (*m
 }
 
 func (b *stubTelegramBot) FileDownloadLink(f *models.File) string {
+	if b.fileURL != "" {
+		return b.fileURL
+	}
 	return "https://test.example.com/file/" + f.FilePath
 }
 
@@ -938,6 +942,83 @@ func TestHandleMessagePrivateTopicUsesThreadID(t *testing.T) {
 	}
 }
 
+func TestHandlePhotoDispatchesCaptionWhenDownloadFails(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		groupReplyAll: true,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.getFileErr = errors.New("telegram timeout")
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	msg := &models.Message{
+		ID:      10,
+		Caption: "please inspect this",
+		Photo:   []models.PhotoSize{{FileID: "photo-small"}, {FileID: "photo-large"}},
+		Date:    int(time.Now().Unix()),
+		From:    &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{
+			ID:   100,
+			Type: models.ChatTypePrivate,
+		},
+	}
+
+	p.handleMessage(context.Background(), msg)
+
+	select {
+	case got := <-handled:
+		if !strings.Contains(got.Content, "please inspect this") {
+			t.Fatalf("Content = %q, want caption to be preserved", got.Content)
+		}
+		if !strings.Contains(got.Content, "image download failed") {
+			t.Fatalf("Content = %q, want download failure note", got.Content)
+		}
+		if len(got.Images) != 0 {
+			t.Fatalf("Images len = %d, want 0", len(got.Images))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("message not handled")
+	}
+
+	if got := stubBot.GetFileCallCount(); got != telegramFileRetries {
+		t.Fatalf("GetFile calls = %d, want %d", got, telegramFileRetries)
+	}
+}
+
+func TestDownloadFileRetriesTransientHTTPFailures(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) < 3 {
+			http.Error(w, "temporary", http.StatusBadGateway)
+			return
+		}
+		fmt.Fprint(w, "image-data")
+	}))
+	defer server.Close()
+
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL + "/file"
+	p := &Platform{token: "token", httpClient: server.Client()}
+	p.bot = stubBot
+
+	data, err := p.downloadFile("photo")
+	if err != nil {
+		t.Fatalf("downloadFile: %v", err)
+	}
+	if string(data) != "image-data" {
+		t.Fatalf("data = %q, want image-data", string(data))
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("HTTP requests = %d, want 3", got)
+	}
+}
+
 func newTelegramTestPlatform(t *testing.T, handler func(http.ResponseWriter, *http.Request)) *Platform {
 	t.Helper()
 
@@ -1035,4 +1116,3 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 		t.Fatalf("ProgressStyle() = %q, want compact", got)
 	}
 }
-
