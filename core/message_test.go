@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSanitizeAttachmentFileName covers the basename-stripping rules used by
@@ -104,5 +105,46 @@ func TestSaveFilesToDisk_RejectsPathTraversal(t *testing.T) {
 	okPath := filepath.Join(attachDir, "ok.txt")
 	if _, err := os.Stat(okPath); err != nil {
 		t.Errorf("legitimate ok.txt not saved: %v", err)
+	}
+}
+
+func TestSaveFilesToDiskCleansExpiredAttachments(t *testing.T) {
+	workDir := t.TempDir()
+	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")
+	if err := os.MkdirAll(attachDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+
+	oldPath := filepath.Join(attachDir, "old.txt")
+	if err := os.WriteFile(oldPath, []byte("old"), 0o644); err != nil {
+		t.Fatalf("WriteFile old: %v", err)
+	}
+	oldTime := time.Now().Add(-(attachmentTTL + time.Hour))
+	if err := os.Chtimes(oldPath, oldTime, oldTime); err != nil {
+		t.Fatalf("Chtimes old: %v", err)
+	}
+
+	recentPath := filepath.Join(attachDir, "recent.txt")
+	if err := os.WriteFile(recentPath, []byte("recent"), 0o644); err != nil {
+		t.Fatalf("WriteFile recent: %v", err)
+	}
+
+	paths := SaveFilesToDisk(workDir, []FileAttachment{{
+		FileName: "new.txt",
+		Data:     []byte("new"),
+		MimeType: "text/plain",
+	}})
+
+	if len(paths) != 1 {
+		t.Fatalf("saved paths len = %d, want 1", len(paths))
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old attachment stat err = %v, want not exist", err)
+	}
+	if _, err := os.Stat(recentPath); err != nil {
+		t.Fatalf("recent attachment missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(attachDir, "new.txt")); err != nil {
+		t.Fatalf("new attachment missing: %v", err)
 	}
 }
