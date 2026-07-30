@@ -388,9 +388,10 @@ func parseStreamLine(line []byte, startedTools map[int]bool) ([]core.Event, stri
 		}
 		result := envelope.Result
 		metadata := map[string]any{
-			"status":          result.Status,
-			"thinking_tokens": result.Usage.ThinkingTokens,
-			"total_tokens":    result.Usage.TotalTokens,
+			"status":                 result.Status,
+			"thinking_tokens":        result.Usage.ThinkingTokens,
+			"total_tokens":           result.Usage.TotalTokens,
+			"authoritative_response": true,
 		}
 		event := core.Event{
 			Type:                 core.EventResult,

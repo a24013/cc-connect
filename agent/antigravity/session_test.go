@@ -203,6 +203,9 @@ func TestParseStreamLine_Result(t *testing.T) {
 	if event.InputTokens != 18725 || event.OutputTokens != 284 || event.CacheReadInputTokens != 12000 {
 		t.Fatalf("usage not propagated: %#v", event)
 	}
+	if authoritative, _ := event.Metadata["authoritative_response"].(bool); !authoritative {
+		t.Fatalf("result metadata = %#v, want authoritative_response=true", event.Metadata)
+	}
 }
 
 func TestParseStreamLine_MalformedJSON(t *testing.T) {

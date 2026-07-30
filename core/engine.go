@@ -5301,7 +5301,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool progress is hidden, segmentStart stays 0 and textParts
 			// contains ALL text across tool boundaries. Prefer the full accumulated
 			// text over event.Content which only contains the last assistant segment.
-			if len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
+			// Some adapters (such as AGY stream-json) mark terminal result.response
+			// as authoritative because streamed text deltas may split malformed UTF-8
+			// boundaries. In that case the exact terminal response must win.
+			authoritativeResponse, _ := event.Metadata["authoritative_response"].(bool)
+			if !authoritativeResponse && len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
 				fullResponse = strings.Join(textParts, "")
 			} else if fullResponse == "" && len(textParts) > 0 {
 				fullResponse = strings.Join(textParts, "")

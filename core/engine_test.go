@@ -1611,6 +1611,42 @@ func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly
 	}
 }
 
+func TestProcessInteractiveEvents_AuthoritativeResultReplacesCorruptStreamText(t *testing.T) {
+	p := &stubPlatformEngine{n: "telegram"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{ThinkingMessages: false, ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: false})
+	sessionKey := "telegram:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "今天真的���大進步"}
+	agentSession.events <- Event{
+		Type:    EventResult,
+		Content: "今天真的是大進步",
+		Done:    true,
+		Metadata: map[string]any{
+			"authoritative_response": true,
+		},
+	}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+
+	sent := p.getSent()
+	if len(sent) != 1 || sent[0] != "今天真的是大進步" {
+		t.Fatalf("sent = %#v, want authoritative terminal response", sent)
+	}
+	history := session.GetHistory(1)
+	if len(history) != 1 || history[0].Content != "今天真的是大進步" {
+		t.Fatalf("history = %#v, want authoritative terminal response", history)
+	}
+}
+
 func TestProcessInteractiveEvents_CompactProgressCoalescesThinkingAndToolUse(t *testing.T) {
 	p := &stubCompactProgressPlatform{stubPlatformEngine: stubPlatformEngine{n: "feishu"}}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
