@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -69,6 +70,15 @@ func New(opts map[string]any) (core.Agent, error) {
 	var timeout time.Duration
 	if timeoutMins > 0 {
 		timeout = time.Duration(timeoutMins) * time.Minute
+	}
+	if raw, ok := opts["print_timeout"].(string); ok && strings.TrimSpace(raw) != "" {
+		parsed, err := time.ParseDuration(strings.TrimSpace(raw))
+		if err != nil {
+			return nil, fmt.Errorf("antigravity: invalid print_timeout %q: %w", raw, err)
+		}
+		timeout = parsed
+		slog.Warn("DEPRECATED: antigravity 'print_timeout' is supported for compatibility; use 'timeout_mins' in new configs",
+			"deprecated_key", "print_timeout", "new_key", "timeout_mins")
 	}
 
 	if _, err := exec.LookPath(cmd); err != nil {
@@ -268,6 +278,40 @@ func (a *Agent) DeleteSession(_ context.Context, sessionID string) error {
 }
 
 func (a *Agent) Stop() error { return nil }
+
+func (a *Agent) GetRolloverStatus(ctx context.Context, sessionID string) (*core.RolloverStatus, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil, fmt.Errorf("antigravity: empty session id")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("antigravity: user home: %w", err)
+	}
+	dbPath := filepath.Join(home, ".gemini", "antigravity-cli", "conversations", sessionID+".db")
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, fmt.Errorf("antigravity: conversation db not found: %w", err)
+	}
+	sqlite3, err := exec.LookPath("sqlite3")
+	if err != nil {
+		return nil, fmt.Errorf("antigravity: sqlite3 not found: %w", err)
+	}
+	dbURI := "file:" + dbPath + "?mode=ro&immutable=1"
+	out, err := exec.CommandContext(ctx, sqlite3, dbURI, "select count(*) from steps;").Output()
+	if err != nil {
+		return nil, fmt.Errorf("antigravity: count steps: %w", err)
+	}
+	steps, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return nil, fmt.Errorf("antigravity: parse steps: %w", err)
+	}
+	return &core.RolloverStatus{
+		Steps:       steps,
+		WarnAt:      2500,
+		RecommendAt: 3000,
+		UrgentAt:    3500,
+	}, nil
+}
 
 func (a *Agent) SetMode(mode string) {
 	a.mu.Lock()

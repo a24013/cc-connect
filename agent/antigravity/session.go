@@ -44,6 +44,45 @@ type antigravitySession struct {
 
 var permissionPromptPattern = regexp.MustCompile(`(?is)(allow|approve|permission).{0,400}(\(y/n\)|\(y\/n\)|\(y\/N\)|\(Y\/n\)|\[y\/n\]|\[y\/N\]|\[Y\/n\]|yes\/no)`)
 
+type streamEnvelope struct {
+	Event          string            `json:"event"`
+	ConversationID string            `json:"conversation_id"`
+	StepUpdate     *streamStepUpdate `json:"step_update,omitempty"`
+	Result         *streamResult     `json:"result,omitempty"`
+}
+
+type streamStepUpdate struct {
+	ConversationID string          `json:"conversation_id"`
+	StepIndex      int             `json:"step_index"`
+	State          string          `json:"state"`
+	StepType       string          `json:"step_type"`
+	TextDelta      string          `json:"text_delta"`
+	ToolName       string          `json:"tool_name"`
+	ToolInfo       *streamToolInfo `json:"tool_info,omitempty"`
+	SubagentInfo   map[string]any  `json:"subagent_info,omitempty"`
+}
+
+type streamToolInfo struct {
+	Name       string         `json:"name"`
+	Parameters map[string]any `json:"parameters"`
+	Output     any            `json:"output,omitempty"`
+}
+
+type streamResult struct {
+	ConversationID string      `json:"conversation_id"`
+	Status         string      `json:"status"`
+	Response       string      `json:"response"`
+	Usage          streamUsage `json:"usage"`
+}
+
+type streamUsage struct {
+	InputTokens     int `json:"input_tokens"`
+	OutputTokens    int `json:"output_tokens"`
+	ThinkingTokens  int `json:"thinking_tokens"`
+	CacheReadTokens int `json:"cache_read_tokens"`
+	TotalTokens     int `json:"total_tokens"`
+}
+
 func newAntigravitySession(ctx context.Context, cmd string, extraArgs []string, workDir, model, mode, resumeID string, extraEnv []string, timeout time.Duration) (*antigravitySession, error) {
 	sessionCtx, cancel := context.WithCancel(ctx)
 
@@ -141,10 +180,7 @@ func (as *antigravitySession) Send(prompt string, images []core.ImageAttachment,
 		}
 		fullPrompt += "\n\n[Attached files saved at: " + strings.Join(fileRefs, ", ") + "]"
 	}
-	args := as.buildAntigravityArgs(chatID, isResume, as.mode, fullPrompt)
-	if strings.TrimSpace(as.model) != "" {
-		slog.Warn("antigravitySession: model is configured but ignored because agy does not support --model yet", "model", as.model)
-	}
+	args := as.buildAntigravityArgs(chatID, isResume, as.mode, as.model, fullPrompt)
 
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -203,7 +239,7 @@ func (as *antigravitySession) Send(prompt string, images []core.ImageAttachment,
 	return nil
 }
 
-func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool, mode, fullPrompt string) []string {
+func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool, mode, model, fullPrompt string) []string {
 	// Prepend extra args from cmd so wrappers like "timeout 3600 agy" work.
 	// Keep "-p <prompt>" at the very end because agy consumes the immediate next arg.
 	args := append([]string{}, as.extraArgs...)
@@ -216,7 +252,10 @@ func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool,
 	case "plan":
 		args = append(args, "--sandbox")
 	}
-	args = append(args, "-p", fullPrompt)
+	if model = strings.TrimSpace(model); model != "" {
+		args = append(args, "--model", model)
+	}
+	args = append(args, "--output-format", "stream-json", "-p", fullPrompt)
 	return args
 }
 
@@ -230,46 +269,6 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 		for _, f := range tempFiles {
 			_ = os.Remove(f)
 		}
-
-		// Detect conversation ID if this was the first turn of a fresh session
-		if as.CurrentSessionID() == "" {
-			var sid string
-			for attempt := 0; attempt < 15; attempt++ {
-				sid = as.detectNewSessionID(preEntries, sendStartedAt)
-				if sid != "" {
-					break
-				}
-				time.Sleep(20 * time.Millisecond)
-			}
-			if sid != "" {
-				as.chatID.Store(sid)
-				slog.Debug("antigravitySession: detected session ID", "session_id", sid)
-				// Emit an EventText carrying the session ID back to core
-				select {
-				case as.events <- core.Event{Type: core.EventText, SessionID: sid}:
-				case <-as.ctx.Done():
-				}
-			}
-		}
-
-		err := cmd.Wait()
-		sid := as.CurrentSessionID()
-		if err != nil {
-			stderrMsg := strings.TrimSpace(stderrBuf.String())
-			if stderrMsg != "" {
-				slog.Error("antigravitySession: process failed", "error", err, "stderr", stderrMsg)
-				select {
-				case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}:
-				case <-as.ctx.Done():
-				}
-			}
-		}
-
-		// Finalize turn
-		select {
-		case as.events <- core.Event{Type: core.EventResult, SessionID: sid, Done: true}:
-		case <-as.ctx.Done():
-		}
 	}()
 
 	go func() {
@@ -277,51 +276,223 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 		_ = stdout.Close()
 	}()
 
-	reader := bufio.NewReader(stdout)
-	buf := make([]byte, 1024)
-	permWindow := ""
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	startedTools := make(map[int]bool)
+	var terminal *core.Event
 
-	for {
-		n, err := reader.Read(buf)
-		if n > 0 {
-			text := string(buf[:n])
-			permWindow += text
-			if len(permWindow) > 4096 {
-				permWindow = permWindow[len(permWindow)-4096:]
-			}
-			if pending, _ := as.permReqID.Load().(string); pending == "" {
-				if prompt, ok := extractPermissionPrompt(permWindow); ok {
-					requestID := fmt.Sprintf("agy-perm-%d", time.Now().UnixNano())
-					as.permReqID.Store(requestID)
-					select {
-					case as.events <- core.Event{
-						Type:         core.EventPermissionRequest,
-						RequestID:    requestID,
-						ToolName:     "terminal_permission",
-						ToolInput:    prompt,
-						ToolInputRaw: map[string]any{"prompt": prompt},
-					}:
-					case <-as.ctx.Done():
-						return
-					}
-				}
-			}
-			select {
-			case as.events <- core.Event{Type: core.EventText, Content: text}:
-			case <-as.ctx.Done():
-				return
-			}
-		}
+	for scanner.Scan() {
+		events, sid, err := parseStreamLine(scanner.Bytes(), startedTools)
 		if err != nil {
-			if err != io.EOF && !strings.Contains(err.Error(), "file already closed") {
-				slog.Error("antigravitySession: read error", "error", err)
-				select {
-				case as.events <- core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}:
-				case <-as.ctx.Done():
-				}
-			}
-			return
+			as.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("parse stream-json: %w", err)})
+			continue
 		}
+		if sid != "" && sid != as.CurrentSessionID() {
+			as.chatID.Store(sid)
+			as.emit(core.Event{Type: core.EventText, SessionID: sid})
+		}
+		for _, event := range events {
+			if event.Type == core.EventResult {
+				eventCopy := event
+				terminal = &eventCopy
+				continue
+			}
+			as.emit(event)
+		}
+	}
+
+	scanErr := scanner.Err()
+	waitErr := cmd.Wait()
+
+	// AGY 1.1.8 emits the conversation ID in the init event. Keep the file
+	// lookup only as a compatibility fallback for an incomplete stream.
+	if as.CurrentSessionID() == "" {
+		for attempt := 0; attempt < 15; attempt++ {
+			if sid := as.detectNewSessionID(preEntries, sendStartedAt); sid != "" {
+				as.chatID.Store(sid)
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+
+	if ctx.Err() != nil {
+		return
+	}
+	if scanErr != nil && !strings.Contains(scanErr.Error(), "file already closed") {
+		as.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("read stream-json: %w", scanErr)})
+		return
+	}
+	if waitErr != nil {
+		stderrMsg := strings.TrimSpace(stderrBuf.String())
+		if stderrMsg == "" {
+			stderrMsg = waitErr.Error()
+		}
+		slog.Error("antigravitySession: process failed", "error", waitErr, "stderr", stderrMsg)
+		as.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)})
+		return
+	}
+	if terminal == nil {
+		stderrMsg := strings.TrimSpace(stderrBuf.String())
+		if stderrMsg != "" {
+			slog.Warn("antigravitySession: stream ended without result", "stderr", stderrMsg)
+		}
+		as.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("agy stream ended without terminal result")})
+		return
+	}
+
+	terminal.SessionID = as.CurrentSessionID()
+	as.emit(*terminal)
+}
+
+func parseStreamLine(line []byte, startedTools map[int]bool) ([]core.Event, string, error) {
+	var envelope streamEnvelope
+	if err := json.Unmarshal(line, &envelope); err != nil {
+		return nil, "", err
+	}
+
+	switch envelope.Event {
+	case "init":
+		return nil, envelope.ConversationID, nil
+	case "step_update":
+		if envelope.StepUpdate == nil {
+			return nil, "", fmt.Errorf("step_update event missing payload")
+		}
+		update := envelope.StepUpdate
+		sid := update.ConversationID
+		if len(update.SubagentInfo) > 0 {
+			return parseSubagentStep(update, startedTools), sid, nil
+		}
+		switch update.StepType {
+		case "agent_response":
+			if update.TextDelta == "" {
+				return nil, sid, nil
+			}
+			return []core.Event{{Type: core.EventText, Content: update.TextDelta, SessionID: sid}}, sid, nil
+		case "tool":
+			return parseToolStep(update, startedTools), sid, nil
+		case "thinking", "planning":
+			if update.TextDelta == "" {
+				return nil, sid, nil
+			}
+			return []core.Event{{Type: core.EventThinking, Content: update.TextDelta, SessionID: sid}}, sid, nil
+		default:
+			if update.TextDelta != "" {
+				return []core.Event{{Type: core.EventThinking, Content: update.TextDelta, SessionID: sid}}, sid, nil
+			}
+			return nil, sid, nil
+		}
+	case "result":
+		if envelope.Result == nil {
+			return nil, "", fmt.Errorf("result event missing payload")
+		}
+		result := envelope.Result
+		metadata := map[string]any{
+			"status":          result.Status,
+			"thinking_tokens": result.Usage.ThinkingTokens,
+			"total_tokens":    result.Usage.TotalTokens,
+		}
+		event := core.Event{
+			Type:                 core.EventResult,
+			Content:              result.Response,
+			SessionID:            result.ConversationID,
+			Done:                 true,
+			InputTokens:          result.Usage.InputTokens,
+			OutputTokens:         result.Usage.OutputTokens,
+			CacheReadInputTokens: result.Usage.CacheReadTokens,
+			Metadata:             metadata,
+		}
+		return []core.Event{event}, result.ConversationID, nil
+	default:
+		return nil, envelope.ConversationID, nil
+	}
+}
+
+func parseSubagentStep(update *streamStepUpdate, startedTools map[int]bool) []core.Event {
+	name := "subagent"
+	for _, key := range []string{"name", "agent_name", "agent"} {
+		if value, ok := update.SubagentInfo[key].(string); ok && strings.TrimSpace(value) != "" {
+			name = value
+			break
+		}
+	}
+
+	var events []core.Event
+	if !startedTools[update.StepIndex] {
+		startedTools[update.StepIndex] = true
+		events = append(events, core.Event{
+			Type:         core.EventToolUse,
+			ToolName:     name,
+			ToolInput:    formatStreamValue(update.SubagentInfo),
+			ToolInputRaw: update.SubagentInfo,
+			SessionID:    update.ConversationID,
+		})
+	}
+	if strings.EqualFold(update.State, "DONE") {
+		events = append(events, core.Event{
+			Type:       core.EventToolResult,
+			ToolName:   name,
+			ToolResult: formatStreamValue(update.SubagentInfo),
+			ToolStatus: strings.ToLower(update.State),
+			SessionID:  update.ConversationID,
+		})
+		delete(startedTools, update.StepIndex)
+	}
+	return events
+}
+
+func parseToolStep(update *streamStepUpdate, startedTools map[int]bool) []core.Event {
+	if update.ToolInfo == nil {
+		return nil
+	}
+	name := update.ToolInfo.Name
+	if name == "" {
+		name = update.ToolName
+	}
+	input := formatStreamValue(update.ToolInfo.Parameters)
+	var events []core.Event
+	if !startedTools[update.StepIndex] {
+		startedTools[update.StepIndex] = true
+		events = append(events, core.Event{
+			Type:         core.EventToolUse,
+			ToolName:     name,
+			ToolInput:    input,
+			ToolInputRaw: update.ToolInfo.Parameters,
+			SessionID:    update.ConversationID,
+		})
+	}
+	if strings.EqualFold(update.State, "DONE") {
+		events = append(events, core.Event{
+			Type:       core.EventToolResult,
+			ToolName:   name,
+			ToolResult: formatStreamValue(update.ToolInfo.Output),
+			ToolStatus: strings.ToLower(update.State),
+			SessionID:  update.ConversationID,
+		})
+		delete(startedTools, update.StepIndex)
+	}
+	return events
+}
+
+func formatStreamValue(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return typed
+	default:
+		encoded, err := json.Marshal(typed)
+		if err != nil {
+			return fmt.Sprint(typed)
+		}
+		return string(encoded)
+	}
+}
+
+func (as *antigravitySession) emit(event core.Event) {
+	select {
+	case as.events <- event:
+	case <-as.ctx.Done():
 	}
 }
 

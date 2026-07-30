@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,6 +128,10 @@ type Platform struct {
 	newBot              botFactory
 	newBackoffTimer     func(time.Duration) backoffTimer
 	newTypingTicker     func(time.Duration) typingTicker
+
+	albumMu       sync.Mutex
+	pendingAlbums map[string]*pendingPhotoAlbum
+	albumDebounce time.Duration
 }
 
 const (
@@ -135,7 +140,24 @@ const (
 	stableConnectionWindow  = 10 * time.Second
 	telegramFileRetries     = 3
 	telegramFileRetryDelay  = 500 * time.Millisecond
+	defaultAlbumDebounce    = 750 * time.Millisecond
 )
+
+type photoAlbumPart struct {
+	msg        *models.Message
+	sessionKey string
+	channelKey string
+	userID     string
+	userName   string
+	chatName   string
+	threadID   int
+}
+
+type pendingPhotoAlbum struct {
+	parts   []photoAlbumPart
+	timer   *time.Timer
+	version uint64
+}
 
 func New(opts map[string]any) (core.Platform, error) {
 	token, _ := opts["token"].(string)
@@ -455,6 +477,19 @@ func (p *Platform) handleMessage(ctx context.Context, msg *models.Message) {
 		chatName = msg.Chat.Title
 	}
 
+	if len(msg.Photo) > 0 && msg.MediaGroupID != "" {
+		p.enqueuePhotoAlbum(photoAlbumPart{
+			msg:        msg,
+			sessionKey: sessionKey,
+			channelKey: channelKey,
+			userID:     userID,
+			userName:   userName,
+			chatName:   chatName,
+			threadID:   threadID,
+		})
+		return
+	}
+
 	if isGroup && !p.groupReplyAll {
 		slog.Debug("telegram: checking group message", "text", msg.Text, "is_command", isCommand(msg))
 		if !p.isDirectedAtBot(msg) {
@@ -626,6 +661,139 @@ func (p *Platform) dispatchMessage(msg *core.Message, tgMsg *models.Message) {
 		return
 	}
 	handler(p, msg)
+}
+
+func (p *Platform) enqueuePhotoAlbum(part photoAlbumPart) {
+	key := fmt.Sprintf("%s:%s", part.sessionKey, part.msg.MediaGroupID)
+	delay := p.albumDebounce
+	if delay <= 0 {
+		delay = defaultAlbumDebounce
+	}
+
+	p.albumMu.Lock()
+	if p.pendingAlbums == nil {
+		p.pendingAlbums = make(map[string]*pendingPhotoAlbum)
+	}
+	album := p.pendingAlbums[key]
+	if album == nil {
+		album = &pendingPhotoAlbum{}
+		p.pendingAlbums[key] = album
+	}
+	album.parts = append(album.parts, part)
+	album.version++
+	version := album.version
+	if album.timer != nil {
+		album.timer.Stop()
+	}
+	album.timer = time.AfterFunc(delay, func() {
+		p.flushPhotoAlbum(key, version)
+	})
+	p.albumMu.Unlock()
+}
+
+func (p *Platform) flushPhotoAlbum(key string, version uint64) {
+	p.albumMu.Lock()
+	album := p.pendingAlbums[key]
+	if album == nil || album.version != version {
+		p.albumMu.Unlock()
+		return
+	}
+	delete(p.pendingAlbums, key)
+	parts := append([]photoAlbumPart(nil), album.parts...)
+	p.albumMu.Unlock()
+
+	p.dispatchPhotoAlbum(parts)
+}
+
+func (p *Platform) dispatchPhotoAlbum(parts []photoAlbumPart) {
+	if len(parts) == 0 {
+		return
+	}
+	sort.Slice(parts, func(i, j int) bool {
+		return parts[i].msg.ID < parts[j].msg.ID
+	})
+
+	first := parts[0]
+	isGroup := first.msg.Chat.Type == models.ChatTypeGroup || first.msg.Chat.Type == models.ChatTypeSupergroup
+	if isGroup && !p.groupReplyAll {
+		directed := false
+		for _, part := range parts {
+			if p.isDirectedAtBot(part.msg) {
+				directed = true
+				break
+			}
+		}
+		if !directed {
+			return
+		}
+	}
+
+	if p.enableReactions {
+		go p.reactToMessage(context.Background(), first.msg.Chat.ID, first.msg.ID, "⚡")
+	}
+
+	botName := p.botUsername()
+	var captions []string
+	seenCaptions := make(map[string]struct{})
+	images := make([]core.ImageAttachment, 0, len(parts))
+	failed := 0
+	contextMessage := first.msg
+
+	for _, part := range parts {
+		caption := strings.TrimSpace(stripBotMention(part.msg.Caption, botName))
+		if caption != "" {
+			if _, seen := seenCaptions[caption]; !seen {
+				captions = append(captions, caption)
+				seenCaptions[caption] = struct{}{}
+			}
+			contextMessage = part.msg
+		}
+		if part.msg.ReplyToMessage != nil {
+			contextMessage = part.msg
+		}
+
+		best := part.msg.Photo[len(part.msg.Photo)-1]
+		imgData, err := p.downloadFile(best.FileID)
+		if err != nil {
+			failed++
+			slog.Error("telegram: download album photo failed",
+				"media_group_id", part.msg.MediaGroupID,
+				"message_id", part.msg.ID,
+				"error", err,
+			)
+			continue
+		}
+		images = append(images, core.ImageAttachment{
+			MimeType: "image/jpeg",
+			Data:     imgData,
+			FileName: fmt.Sprintf("telegram_album_%d.jpg", part.msg.ID),
+		})
+	}
+
+	content := strings.Join(captions, "\n\n")
+	if failed > 0 {
+		failureNote := fmt.Sprintf("[Telegram album image download failed: %d of %d images unavailable.]", failed, len(parts))
+		if content == "" {
+			content = failureNote
+		} else {
+			content += "\n\n" + failureNote
+		}
+	}
+
+	rctx := replyContext{
+		chatID:    contextMessage.Chat.ID,
+		threadID:  first.threadID,
+		messageID: contextMessage.ID,
+	}
+	p.dispatchMessage(&core.Message{
+		SessionKey: first.sessionKey, Platform: "telegram",
+		UserID: first.userID, UserName: first.userName, ChatName: first.chatName,
+		Content:    content,
+		MessageID:  strconv.Itoa(contextMessage.ID),
+		ChannelKey: first.channelKey,
+		Images:     images,
+		ReplyCtx:   rctx,
+	}, contextMessage)
 }
 
 func (p *Platform) messageHandler() core.MessageHandler {
@@ -1721,6 +1889,14 @@ func (p *Platform) Stop() error {
 	if cancel != nil {
 		cancel()
 	}
+	p.albumMu.Lock()
+	for key, album := range p.pendingAlbums {
+		if album.timer != nil {
+			album.timer.Stop()
+		}
+		delete(p.pendingAlbums, key)
+	}
+	p.albumMu.Unlock()
 	return nil
 }
 

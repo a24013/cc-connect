@@ -552,6 +552,21 @@ type ContextCompressor interface {
 	CompressCommand() string
 }
 
+// RolloverStatusReporter is an optional interface for agents that can report
+// whether the active backend conversation is getting long enough to benefit
+// from a handoff into a fresh session.
+type RolloverStatusReporter interface {
+	GetRolloverStatus(ctx context.Context, sessionID string) (*RolloverStatus, error)
+}
+
+// RolloverStatus describes backend conversation length for rollover reminders.
+type RolloverStatus struct {
+	Steps       int
+	WarnAt      int
+	RecommendAt int
+	UrgentAt    int
+}
+
 // AgentSessionCanceller is an optional interface for agent sessions that support
 // cancelling the current turn without terminating the session or its underlying
 // process. When implemented, the engine calls CancelTurn instead of Close() for

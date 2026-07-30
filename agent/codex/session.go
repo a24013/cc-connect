@@ -59,6 +59,7 @@ type codexSession struct {
 
 var codexSessionCloseTimeout = 8 * time.Second
 var codexSessionForceKillWait = 2 * time.Second
+var codexStartupRetryDelay = time.Second
 var codexRuntimeConfigCacheTTL = 5 * time.Second
 var codexRuntimeConfigTimeout = 1500 * time.Millisecond
 var codexContextUsageRetryDelay = 50 * time.Millisecond
@@ -136,6 +137,13 @@ func (cs *codexSession) Send(prompt string, images []core.ImageAttachment, files
 	if !isResume {
 		prompt = prependCodexPromptPreamble(prompt, cs.promptPreamble)
 	}
+	return cs.launchExec(prompt, imagePaths, 0)
+}
+
+// launchExec starts one Codex CLI attempt. A process that exits before creating
+// a thread can be retried safely because no model turn or tool call has started.
+func (cs *codexSession) launchExec(prompt string, imagePaths []string, attempt int) error {
+	isResume := cs.CurrentSessionID() != ""
 	args := cs.buildExecArgs(prompt, imagePaths)
 	if len(cs.cliExtraArgs) > 0 {
 		args = append(append([]string{}, cs.cliExtraArgs...), args...)
@@ -146,7 +154,7 @@ func (cs *codexSession) Send(prompt string, images []core.ImageAttachment, files
 		bin = "codex"
 	}
 
-	slog.Debug("codexSession: launching", "resume", isResume, "args", core.RedactArgs(args))
+	slog.Debug("codexSession: launching", "resume", isResume, "attempt", attempt+1, "args", core.RedactArgs(args))
 
 	cmd := exec.CommandContext(cs.ctx, bin, args...)
 	cmd.Dir = cs.workDir
@@ -170,7 +178,7 @@ func (cs *codexSession) Send(prompt string, images []core.ImageAttachment, files
 	cs.addCmd(cmd)
 
 	cs.wg.Add(1)
-	go cs.readLoop(cmd, stdout, &stderrBuf)
+	go cs.readLoop(cmd, stdout, &stderrBuf, prompt, imagePaths, attempt)
 
 	return nil
 }
@@ -296,28 +304,10 @@ func codexImageExt(mime string) string {
 	}
 }
 
-func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer) {
+func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, prompt string, imagePaths []string, attempt int) {
 	defer cs.wg.Done()
-	defer func() {
-		defer cs.removeCmd(cmd)
-		if err := cmd.Wait(); err != nil {
-			stderrMsg := strings.TrimSpace(stderrBuf.String())
-			if stderrMsg != "" {
-				slog.Error("codexSession: process failed", "error", err, "stderr", stderrMsg)
-				evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
-				select {
-				case cs.events <- evt:
-				case <-cs.ctx.Done():
-					return
-				}
-			}
-		}
-		if tid := cs.CurrentSessionID(); tid != "" {
-			patchSessionSource(tid, getenvFromList(cs.extraEnv, "CODEX_HOME"))
-		}
-	}()
 
-	if err := readJSONLines(stdout, func(line []byte) error {
+	readErr := readJSONLines(stdout, func(line []byte) error {
 		lineText := string(line)
 		if lineText == "" {
 			return nil
@@ -333,14 +323,60 @@ func (cs *codexSession) readLoop(cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf 
 
 		cs.handleEvent(raw)
 		return nil
-	}); err != nil {
-		slog.Error("codexSession: read stdout error", "error", err)
-		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", err)}
+	})
+	waitErr := cmd.Wait()
+	cs.removeCmd(cmd)
+
+	if readErr != nil {
+		slog.Error("codexSession: read stdout error", "error", readErr)
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("read stdout: %w", readErr)}
 		select {
 		case cs.events <- evt:
 		case <-cs.ctx.Done():
 			return
 		}
+	}
+
+	if waitErr != nil {
+		if cs.ctx.Err() != nil || !cs.alive.Load() {
+			return
+		}
+		stderrMsg := strings.TrimSpace(stderrBuf.String())
+		if attempt == 0 && cs.CurrentSessionID() == "" {
+			slog.Warn("codexSession: startup failed before thread creation; retrying once", "error", waitErr, "stderr", stderrMsg)
+			timer := time.NewTimer(codexStartupRetryDelay)
+			select {
+			case <-timer.C:
+			case <-cs.ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return
+			}
+			if err := cs.launchExec(prompt, imagePaths, attempt+1); err == nil {
+				return
+			} else {
+				stderrMsg = strings.TrimSpace(stderrMsg + "\nretry start failed: " + err.Error())
+			}
+		}
+
+		if stderrMsg == "" {
+			stderrMsg = waitErr.Error()
+		}
+		slog.Error("codexSession: process failed", "error", waitErr, "stderr", stderrMsg)
+		evt := core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)}
+		select {
+		case cs.events <- evt:
+		case <-cs.ctx.Done():
+			return
+		}
+	}
+
+	if tid := cs.CurrentSessionID(); tid != "" {
+		patchSessionSource(tid, getenvFromList(cs.extraEnv, "CODEX_HOME"))
 	}
 }
 

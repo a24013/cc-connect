@@ -991,6 +991,74 @@ func TestHandlePhotoDispatchesCaptionWhenDownloadFails(t *testing.T) {
 	}
 }
 
+func TestHandlePhotoAlbumDispatchesOnePromptWithAllImages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "image-data")
+	}))
+	defer server.Close()
+
+	handled := make(chan *core.Message, 2)
+	p := &Platform{
+		token:         "token",
+		httpClient:    server.Client(),
+		groupReplyAll: true,
+		albumDebounce: 20 * time.Millisecond,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL + "/file"
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	base := models.Message{
+		Date:         int(time.Now().Unix()),
+		From:         &models.User{ID: 7, Username: "alice"},
+		MediaGroupID: "album-1",
+		Chat: models.Chat{
+			ID:   100,
+			Type: models.ChatTypePrivate,
+		},
+	}
+	second := base
+	second.ID = 11
+	second.Photo = []models.PhotoSize{{FileID: "photo-2"}}
+	first := base
+	first.ID = 10
+	first.Caption = "compare these screenshots"
+	first.Photo = []models.PhotoSize{{FileID: "photo-1"}}
+
+	// Telegram album updates do not have to be delivered in message-id order.
+	p.handleMessage(context.Background(), &second)
+	p.handleMessage(context.Background(), &first)
+
+	select {
+	case got := <-handled:
+		if got.Content != "compare these screenshots" {
+			t.Fatalf("Content = %q, want album caption", got.Content)
+		}
+		if len(got.Images) != 2 {
+			t.Fatalf("Images len = %d, want 2", len(got.Images))
+		}
+		if got.Images[0].FileName != "telegram_album_10.jpg" || got.Images[1].FileName != "telegram_album_11.jpg" {
+			t.Fatalf("image order = [%q, %q], want message-id order", got.Images[0].FileName, got.Images[1].FileName)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("album was not handled")
+	}
+
+	select {
+	case got := <-handled:
+		t.Fatalf("album dispatched more than once: %#v", got)
+	case <-time.After(60 * time.Millisecond):
+	}
+
+	if got := stubBot.GetFileCallCount(); got != 2 {
+		t.Fatalf("GetFile calls = %d, want 2", got)
+	}
+}
+
 func TestDownloadFileRetriesTransientHTTPFailures(t *testing.T) {
 	var requests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {

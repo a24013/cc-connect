@@ -517,6 +517,7 @@ type interactiveState struct {
 	pendingProviderAdd       *pendingProviderAddState
 	lastAutoCompressAt       time.Time
 	lastAutoCompressTokens   int
+	lastRolloverReminder     int
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -5580,6 +5581,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				slog.Debug("tts: not enabled", "tts_nil", e.tts == nil, "enabled", e.tts != nil && e.tts.Enabled, "tts_obj_nil", e.tts == nil || e.tts.TTS == nil)
 			}
 
+			e.maybeSendRolloverReminder(p, replyCtx, replyAgent, state)
+
 			// Auto-compress after finishing a turn, before sending any queued messages.
 			if triggerAutoCompress {
 				compressor, ok := e.agent.(ContextCompressor)
@@ -6039,6 +6042,7 @@ var builtinCommands = []struct {
 	{[]string{"timer", "at", "remind"}, "timer"},
 	{[]string{"heartbeat", "hb"}, "heartbeat"},
 	{[]string{"compress", "compact"}, "compress"},
+	{[]string{"rollover_agy", "rollover"}, "rollover_agy"},
 	{[]string{"stop"}, "stop"},
 	{[]string{"cancel"}, "cancel"},
 	{[]string{"help"}, "help"},
@@ -6258,6 +6262,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdHeartbeat(p, msg, args)
 	case "compress":
 		e.cmdCompress(p, msg)
+	case "rollover_agy":
+		e.cmdAgyRollover(p, msg)
 	case "stop":
 		e.cmdStop(p, msg)
 	case "cancel":

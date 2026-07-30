@@ -4,8 +4,10 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -70,7 +72,7 @@ func TestSession_ContinueSessionTreatedAsFresh(t *testing.T) {
 
 func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
 	s, _ := newAntigravitySession(context.Background(), "echo", nil, "/tmp", "", "default", "", nil, 0)
-	args := s.buildAntigravityArgs("sid-1", true, "plan", "What is 1+1?")
+	args := s.buildAntigravityArgs("sid-1", true, "plan", "gemini-3.1-pro-preview", "What is 1+1?")
 	if len(args) < 2 {
 		t.Fatalf("args too short: %v", args)
 	}
@@ -80,8 +82,193 @@ func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
 	if !contains(args, "--sandbox") {
 		t.Fatalf("expected --sandbox in args, got: %v", args)
 	}
-	if contains(args, "-m") || contains(args, "--model") {
-		t.Fatalf("did not expect model flags in args, got: %v", args)
+	if !containsSequence(args, "--output-format", "stream-json") {
+		t.Fatalf("expected stream-json output in args, got: %v", args)
+	}
+	if !containsSequence(args, "--model", "gemini-3.1-pro-preview") {
+		t.Fatalf("expected model flag in args, got: %v", args)
+	}
+}
+
+func TestParseStreamLine_Init(t *testing.T) {
+	events, sid, err := parseStreamLine([]byte(`{"event":"init","conversation_id":"conv-1","init":{"cwd":"/tmp"}}`), map[int]bool{})
+	if err != nil {
+		t.Fatalf("parseStreamLine: %v", err)
+	}
+	if sid != "conv-1" {
+		t.Fatalf("session ID = %q, want conv-1", sid)
+	}
+	if len(events) != 0 {
+		t.Fatalf("init events = %#v, want none", events)
+	}
+}
+
+func TestParseStreamLine_AgentResponseDelta(t *testing.T) {
+	line := `{"event":"step_update","step_update":{"conversation_id":"conv-1","step_index":3,"state":"ACTIVE","step_type":"agent_response","text_delta":"hello"}}`
+	events, sid, err := parseStreamLine([]byte(line), map[int]bool{})
+	if err != nil {
+		t.Fatalf("parseStreamLine: %v", err)
+	}
+	if sid != "conv-1" || len(events) != 1 {
+		t.Fatalf("sid=%q events=%#v", sid, events)
+	}
+	if events[0].Type != core.EventText || events[0].Content != "hello" {
+		t.Fatalf("event = %#v, want EventText hello", events[0])
+	}
+}
+
+func TestParseStreamLine_ToolLifecycle(t *testing.T) {
+	started := map[int]bool{}
+	active := `{"event":"step_update","step_update":{"conversation_id":"conv-1","step_index":4,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"pwd"}}}}`
+	events, _, err := parseStreamLine([]byte(active), started)
+	if err != nil {
+		t.Fatalf("parse active tool: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != core.EventToolUse {
+		t.Fatalf("active events = %#v, want one EventToolUse", events)
+	}
+	if events[0].ToolInputRaw["CommandLine"] != "pwd" {
+		t.Fatalf("tool input = %#v", events[0].ToolInputRaw)
+	}
+
+	done := `{"event":"step_update","step_update":{"conversation_id":"conv-1","step_index":4,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"pwd"},"output":"/tmp\n"}}}`
+	events, _, err = parseStreamLine([]byte(done), started)
+	if err != nil {
+		t.Fatalf("parse completed tool: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != core.EventToolResult {
+		t.Fatalf("done events = %#v, want one EventToolResult", events)
+	}
+	if events[0].ToolResult != "/tmp\n" {
+		t.Fatalf("tool result = %q, want /tmp newline", events[0].ToolResult)
+	}
+}
+
+func TestParseStreamLine_ToolDoneWithoutActive(t *testing.T) {
+	line := `{"event":"step_update","step_update":{"conversation_id":"conv-1","step_index":4,"state":"DONE","step_type":"tool","tool_info":{"name":"read_file","parameters":{"path":"README.md"},"output":"ok"}}}`
+	events, _, err := parseStreamLine([]byte(line), map[int]bool{})
+	if err != nil {
+		t.Fatalf("parseStreamLine: %v", err)
+	}
+	if len(events) != 2 || events[0].Type != core.EventToolUse || events[1].Type != core.EventToolResult {
+		t.Fatalf("events = %#v, want use followed by result", events)
+	}
+}
+
+func TestParseStreamLine_SubagentLifecycle(t *testing.T) {
+	started := map[int]bool{}
+	active := `{"event":"step_update","step_update":{"conversation_id":"conv-1","step_index":8,"state":"ACTIVE","step_type":"subagent","subagent_info":{"agent_name":"researcher","conversation_id":"child-1","log_uri":"file:///tmp/child.log"}}}`
+	events, _, err := parseStreamLine([]byte(active), started)
+	if err != nil {
+		t.Fatalf("parse active subagent: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != core.EventToolUse || events[0].ToolName != "researcher" {
+		t.Fatalf("active events = %#v", events)
+	}
+
+	done := `{"event":"step_update","step_update":{"conversation_id":"conv-1","step_index":8,"state":"DONE","step_type":"subagent","subagent_info":{"agent_name":"researcher","conversation_id":"child-1","log_uri":"file:///tmp/child.log"}}}`
+	events, _, err = parseStreamLine([]byte(done), started)
+	if err != nil {
+		t.Fatalf("parse completed subagent: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != core.EventToolResult || !strings.Contains(events[0].ToolResult, "child-1") {
+		t.Fatalf("done events = %#v", events)
+	}
+}
+
+func TestParseStreamLine_UnknownTextStepSurfacesAsThinking(t *testing.T) {
+	line := `{"event":"step_update","step_update":{"conversation_id":"conv-1","step_index":2,"state":"ACTIVE","step_type":"future_step","text_delta":"working"}}`
+	events, _, err := parseStreamLine([]byte(line), map[int]bool{})
+	if err != nil {
+		t.Fatalf("parseStreamLine: %v", err)
+	}
+	if len(events) != 1 || events[0].Type != core.EventThinking || events[0].Content != "working" {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestParseStreamLine_Result(t *testing.T) {
+	line := `{"event":"result","result":{"conversation_id":"conv-1","status":"SUCCESS","response":"done\n","usage":{"input_tokens":18725,"output_tokens":284,"thinking_tokens":276,"cache_read_tokens":12000,"total_tokens":19009}}}`
+	events, sid, err := parseStreamLine([]byte(line), map[int]bool{})
+	if err != nil {
+		t.Fatalf("parseStreamLine: %v", err)
+	}
+	if sid != "conv-1" || len(events) != 1 {
+		t.Fatalf("sid=%q events=%#v", sid, events)
+	}
+	event := events[0]
+	if event.Type != core.EventResult || !event.Done || event.Content != "done\n" {
+		t.Fatalf("result event = %#v", event)
+	}
+	if event.InputTokens != 18725 || event.OutputTokens != 284 || event.CacheReadInputTokens != 12000 {
+		t.Fatalf("usage not propagated: %#v", event)
+	}
+}
+
+func TestParseStreamLine_MalformedJSON(t *testing.T) {
+	if _, _, err := parseStreamLine([]byte(`{"event":`), map[int]bool{}); err == nil {
+		t.Fatal("expected malformed JSON error")
+	}
+}
+
+func TestSession_SendParsesStreamJSONEndToEnd(t *testing.T) {
+	workDir := t.TempDir()
+	scriptPath := filepath.Join(workDir, "fake-agy")
+	argsPath := filepath.Join(workDir, "args.txt")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$@\" > \"$AGY_ARGS_FILE\"\n" +
+		"printf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"conv-e2e\",\"init\":{\"cwd\":\"/tmp\"}}'\n" +
+		"printf '%s\\n' '{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"conv-e2e\",\"step_index\":3,\"state\":\"ACTIVE\",\"step_type\":\"agent_response\",\"text_delta\":\"hello\"}}'\n" +
+		"printf '%s\\n' '{\"event\":\"result\",\"result\":{\"conversation_id\":\"conv-e2e\",\"status\":\"SUCCESS\",\"response\":\"hello\",\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"cache_read_tokens\":3,\"total_tokens\":12}}}'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("AGY_ARGS_FILE", argsPath)
+
+	s, err := newAntigravitySession(context.Background(), scriptPath, nil, workDir, "", "yolo", "", nil, time.Minute)
+	if err != nil {
+		t.Fatalf("newAntigravitySession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("test prompt", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	var gotText, gotResult bool
+	timeout := time.After(3 * time.Second)
+	for !gotResult {
+		select {
+		case event := <-s.Events():
+			switch event.Type {
+			case core.EventText:
+				if event.Content == "hello" {
+					gotText = true
+				}
+			case core.EventError:
+				t.Fatalf("unexpected error: %v", event.Error)
+			case core.EventResult:
+				gotResult = true
+				if event.Content != "hello" || event.SessionID != "conv-e2e" {
+					t.Fatalf("result = %#v", event)
+				}
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for result")
+		}
+	}
+	if !gotText {
+		t.Fatal("missing streamed EventText")
+	}
+	if got := s.CurrentSessionID(); got != "conv-e2e" {
+		t.Fatalf("CurrentSessionID = %q, want conv-e2e", got)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read args: %v", err)
+	}
+	args := strings.Fields(string(argsData))
+	if !containsSequence(args, "--output-format", "stream-json") {
+		t.Fatalf("args = %v, missing stream-json", args)
 	}
 }
 
@@ -161,6 +348,22 @@ func TestExtractPermissionPrompt_SplitChunksDetectedInWindow(t *testing.T) {
 func contains(xs []string, want string) bool {
 	for _, x := range xs {
 		if strings.TrimSpace(x) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func containsSequence(xs []string, want ...string) bool {
+	for i := 0; i+len(want) <= len(xs); i++ {
+		match := true
+		for j := range want {
+			if xs[i+j] != want[j] {
+				match = false
+				break
+			}
+		}
+		if match {
 			return true
 		}
 	}
