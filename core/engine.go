@@ -7521,7 +7521,14 @@ func defaultShellFlag() string {
 // just send the result directly (no intermediate messages). If it's still running,
 // send a progress message and keep updating until completion.
 func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, workDir string, timeout time.Duration, maxOutput int) error {
-	cmdLabel := truncateStr(command, 60)
+	return e.runShellWithProgressLabel(p, replyCtx, command, command, workDir, timeout, maxOutput)
+}
+
+// runShellWithProgressLabel executes command while using a separate, safe
+// display label. Config-defined commands may contain inline credentials or
+// other private implementation details that must never be echoed to chat.
+func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, displayLabel, workDir string, timeout time.Duration, maxOutput int) error {
+	cmdLabel := truncateStr(displayLabel, 60)
 
 	ctx, cancel := context.WithTimeout(e.ctx, timeout)
 	defer cancel()
@@ -14279,7 +14286,6 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 func (e *Engine) executeShellCommand(p Platform, msg *Message, cmd *CustomCommand, args []string) {
 	slog.Info("executing shell command",
 		"command", cmd.Name,
-		"exec", cmd.Exec,
 		"user", msg.UserName,
 	)
 
@@ -14300,7 +14306,7 @@ func (e *Engine) executeShellCommand(p Platform, msg *Message, cmd *CustomComman
 		workDir, _ = os.Getwd()
 	}
 
-	_ = e.runShellWithProgress(p, msg.ReplyCtx, execCmd, workDir, 60*time.Second, 4000)
+	_ = e.runShellWithProgressLabel(p, msg.ReplyCtx, execCmd, "/"+cmd.Name, workDir, 60*time.Second, 4000)
 }
 
 func (e *Engine) cmdCommands(p Platform, msg *Message, args []string) {

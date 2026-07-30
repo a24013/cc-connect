@@ -10809,6 +10809,42 @@ func TestRunShellWithProgress_BasicOutput(t *testing.T) {
 	}
 }
 
+func TestRunShellWithProgress_CustomLabelDoesNotExposeCommand(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	const secret = "credential-must-not-appear"
+	command := "PRIVATE_TOKEN=" + secret + "; sleep 0.6; echo safe-output"
+	if runtime.GOOS == "windows" {
+		command = "$env:PRIVATE_TOKEN='" + secret + "'; Start-Sleep -Milliseconds 600; Write-Output safe-output"
+	}
+
+	err := e.runShellWithProgressLabel(p, "ctx", command, "/food", t.TempDir(), 5*time.Second, 4000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	sent := p.getSent()
+	if len(sent) == 0 {
+		t.Fatal("expected progress or final shell response")
+	}
+	for _, message := range sent {
+		if strings.Contains(message, secret) {
+			t.Fatalf("secret leaked in shell response: %q", message)
+		}
+		if strings.Contains(message, "PRIVATE_TOKEN") {
+			t.Fatalf("command implementation leaked in shell response: %q", message)
+		}
+	}
+	last := sent[len(sent)-1]
+	if !strings.Contains(last, "/food") {
+		t.Fatalf("expected safe command label, got %q", last)
+	}
+	if !strings.Contains(last, "safe-output") {
+		t.Fatalf("expected command output, got %q", last)
+	}
+}
+
 func TestRunShellWithProgress_FailedCommand(t *testing.T) {
 	p := &stubPlatformEngine{n: "test"}
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
