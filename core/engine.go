@@ -7521,13 +7521,13 @@ func defaultShellFlag() string {
 // just send the result directly (no intermediate messages). If it's still running,
 // send a progress message and keep updating until completion.
 func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, workDir string, timeout time.Duration, maxOutput int) error {
-	return e.runShellWithProgressLabel(p, replyCtx, command, command, workDir, timeout, maxOutput)
+	return e.runShellWithProgressLabel(p, replyCtx, command, command, false, workDir, timeout, maxOutput)
 }
 
 // runShellWithProgressLabel executes command while using a separate, safe
 // display label. Config-defined commands may contain inline credentials or
 // other private implementation details that must never be echoed to chat.
-func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, displayLabel, workDir string, timeout time.Duration, maxOutput int) error {
+func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, displayLabel string, plainOutput bool, workDir string, timeout time.Duration, maxOutput int) error {
 	cmdLabel := truncateStr(displayLabel, 60)
 
 	ctx, cancel := context.WithTimeout(e.ctx, timeout)
@@ -7547,7 +7547,11 @@ func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, di
 
 	if err := cmd.Start(); err != nil {
 		errMsg := fmt.Sprintf("failed to start command: %v", err)
-		e.reply(p, replyCtx, fmt.Sprintf("❌ `%s`\n```\n%s\n```", cmdLabel, errMsg))
+		if plainOutput {
+			e.reply(p, replyCtx, fmt.Sprintf("❌ %s\n\n%s", cmdLabel, errMsg))
+		} else {
+			e.reply(p, replyCtx, fmt.Sprintf("❌ `%s`\n```\n%s\n```", cmdLabel, errMsg))
+		}
 		return err
 	}
 
@@ -7585,14 +7589,14 @@ func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, di
 	select {
 	case <-doneCh:
 		// Command finished within the quick window — send result directly
-		return e.finishShellCmd(p, replyCtx, cmd, &mu, &buf, cmdLabel, maxOutput, false, cmdWaitErr)
+		return e.finishShellCmd(p, replyCtx, cmd, &mu, &buf, cmdLabel, maxOutput, plainOutput, false, cmdWaitErr)
 	case <-ctx.Done():
 		// Timeout before even the quick window elapsed (very short timeout)
 		killAndWait(cmd, doneCh)
 		mu.Lock()
 		output := buf.String()
 		mu.Unlock()
-		e.send(p, replyCtx, e.formatShellTimeout(cmdLabel, output, maxOutput))
+		e.send(p, replyCtx, e.formatShellTimeout(cmdLabel, output, maxOutput, plainOutput))
 		return fmt.Errorf("command timed out after %s", timeout)
 	case <-time.After(quickFinishTimeout):
 		// Still running — fall through to progress mode
@@ -7606,7 +7610,7 @@ func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, di
 			mu.Lock()
 			output := buf.String()
 			mu.Unlock()
-			progressMsg := e.formatShellProgress(cmdLabel, output, maxOutput)
+			progressMsg := e.formatShellProgress(cmdLabel, output, maxOutput, plainOutput)
 			handle, err := starter.SendPreviewStart(e.ctx, replyCtx, progressMsg)
 			if err == nil && handle != nil {
 				previewHandle = handle
@@ -7632,7 +7636,7 @@ func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, di
 					mu.Lock()
 					output := buf.String()
 					mu.Unlock()
-					msg := e.formatShellProgress(cmdLabel, output, maxOutput)
+					msg := e.formatShellProgress(cmdLabel, output, maxOutput, plainOutput)
 					_ = updaterFor(p).UpdateMessage(e.ctx, previewHandle, msg)
 				case <-updateDone:
 					return
@@ -7647,14 +7651,14 @@ func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, di
 	select {
 	case <-doneCh:
 		close(updateDone)
-		return e.finishShellCmd(p, replyCtx, cmd, &mu, &buf, cmdLabel, maxOutput, useUpdate, previewHandle, cmdWaitErr)
+		return e.finishShellCmd(p, replyCtx, cmd, &mu, &buf, cmdLabel, maxOutput, plainOutput, useUpdate, previewHandle, cmdWaitErr)
 	case <-ctx.Done():
 		close(updateDone)
 		killAndWait(cmd, doneCh)
 		mu.Lock()
 		output := buf.String()
 		mu.Unlock()
-		timeoutMsg := e.formatShellTimeout(cmdLabel, output, maxOutput)
+		timeoutMsg := e.formatShellTimeout(cmdLabel, output, maxOutput, plainOutput)
 		if useUpdate {
 			_ = updaterFor(p).UpdateMessage(e.ctx, previewHandle, timeoutMsg)
 		} else {
@@ -7675,7 +7679,7 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max-3]) + "..."
 }
 
-func (e *Engine) finishShellCmd(p Platform, replyCtx any, cmd *exec.Cmd, mu *sync.Mutex, buf *bytes.Buffer, cmdLabel string, maxOutput int, opts ...any) error {
+func (e *Engine) finishShellCmd(p Platform, replyCtx any, cmd *exec.Cmd, mu *sync.Mutex, buf *bytes.Buffer, cmdLabel string, maxOutput int, plainOutput bool, opts ...any) error {
 	var waitErr error
 	// Extract waitErr from opts if provided as the last error argument.
 	for _, o := range opts {
@@ -7699,14 +7703,22 @@ func (e *Engine) finishShellCmd(p Platform, replyCtx any, cmd *exec.Cmd, mu *syn
 
 	var finalMsg string
 	if exitOK {
-		finalMsg = fmt.Sprintf("✅ `%s`\n```\n%s\n```", cmdLabel, display)
+		if plainOutput {
+			finalMsg = display
+		} else {
+			finalMsg = fmt.Sprintf("✅ `%s`\n```\n%s\n```", cmdLabel, display)
+		}
 	} else {
 		// Prefer the wait error message when we have no captured output,
 		// since it often contains the actual failure reason.
 		if display == "" && waitErr != nil {
 			display = truncateRunes(waitErr.Error(), maxOutput)
 		}
-		finalMsg = fmt.Sprintf("❌ `%s` (exit code %d)\n```\n%s\n```", cmdLabel, exitCode, display)
+		if plainOutput {
+			finalMsg = fmt.Sprintf("❌ %s (exit code %d)\n\n%s", cmdLabel, exitCode, display)
+		} else {
+			finalMsg = fmt.Sprintf("❌ `%s` (exit code %d)\n```\n%s\n```", cmdLabel, exitCode, display)
+		}
 	}
 
 	// opts: [useUpdate bool, previewHandle any]
@@ -7730,13 +7742,25 @@ func (e *Engine) finishShellCmd(p Platform, replyCtx any, cmd *exec.Cmd, mu *syn
 	return nil
 }
 
-func (e *Engine) formatShellProgress(cmdLabel, output string, maxOutput int) string {
+func (e *Engine) formatShellProgress(cmdLabel, output string, maxOutput int, plainOutput bool) string {
 	display := truncateRunes(output, maxOutput)
+	if plainOutput {
+		if strings.TrimSpace(display) == "" {
+			return fmt.Sprintf("⏳ %s", cmdLabel)
+		}
+		return fmt.Sprintf("⏳ %s\n\n%s", cmdLabel, display)
+	}
 	return fmt.Sprintf("⏳ `%s`\n```\n%s\n```", cmdLabel, display)
 }
 
-func (e *Engine) formatShellTimeout(cmdLabel, output string, maxOutput int) string {
+func (e *Engine) formatShellTimeout(cmdLabel, output string, maxOutput int, plainOutput bool) string {
 	display := truncateRunes(output, maxOutput)
+	if plainOutput {
+		if strings.TrimSpace(display) == "" {
+			return fmt.Sprintf("⚠️ %s (timeout)", cmdLabel)
+		}
+		return fmt.Sprintf("⚠️ %s (timeout)\n\n%s", cmdLabel, display)
+	}
 	return fmt.Sprintf("⚠️ `%s` (timeout)\n```\n%s\n```", cmdLabel, display)
 }
 
@@ -14306,7 +14330,7 @@ func (e *Engine) executeShellCommand(p Platform, msg *Message, cmd *CustomComman
 		workDir, _ = os.Getwd()
 	}
 
-	_ = e.runShellWithProgressLabel(p, msg.ReplyCtx, execCmd, "/"+cmd.Name, workDir, 60*time.Second, 4000)
+	_ = e.runShellWithProgressLabel(p, msg.ReplyCtx, execCmd, "/"+cmd.Name, true, workDir, 60*time.Second, 4000)
 }
 
 func (e *Engine) cmdCommands(p Platform, msg *Message, args []string) {

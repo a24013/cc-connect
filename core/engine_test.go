@@ -10819,7 +10819,7 @@ func TestRunShellWithProgress_CustomLabelDoesNotExposeCommand(t *testing.T) {
 		command = "$env:PRIVATE_TOKEN='" + secret + "'; Start-Sleep -Milliseconds 600; Write-Output safe-output"
 	}
 
-	err := e.runShellWithProgressLabel(p, "ctx", command, "/food", t.TempDir(), 5*time.Second, 4000)
+	err := e.runShellWithProgressLabel(p, "ctx", command, "/food", true, t.TempDir(), 5*time.Second, 4000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -10837,11 +10837,11 @@ func TestRunShellWithProgress_CustomLabelDoesNotExposeCommand(t *testing.T) {
 		}
 	}
 	last := sent[len(sent)-1]
-	if !strings.Contains(last, "/food") {
-		t.Fatalf("expected safe command label, got %q", last)
+	if last != "safe-output" {
+		t.Fatalf("expected plain command output only, got %q", last)
 	}
-	if !strings.Contains(last, "safe-output") {
-		t.Fatalf("expected command output, got %q", last)
+	if strings.Contains(last, "```") || strings.Contains(last, "`/food`") {
+		t.Fatalf("expected no code block or command label, got %q", last)
 	}
 }
 
