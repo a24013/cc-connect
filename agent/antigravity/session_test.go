@@ -275,6 +275,70 @@ func TestSession_SendParsesStreamJSONEndToEnd(t *testing.T) {
 	}
 }
 
+func TestSession_TimeoutEmitsError(t *testing.T) {
+	workDir := t.TempDir()
+	scriptPath := filepath.Join(workDir, "fake-agy-timeout")
+	script := "#!/bin/sh\n" +
+		"sleep 5\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+
+	s, err := newAntigravitySession(context.Background(), scriptPath, nil, workDir, "", "yolo", "", nil, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("newAntigravitySession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("test timeout", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case event := <-s.Events():
+		if event.Type != core.EventError || event.Error == nil || !strings.Contains(event.Error.Error(), "timed out") {
+			t.Fatalf("event = %#v, want timeout EventError", event)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for timeout EventError")
+	}
+}
+
+func TestSession_ScheduleToolIsRejected(t *testing.T) {
+	workDir := t.TempDir()
+	scriptPath := filepath.Join(workDir, "fake-agy-schedule")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"conv-schedule\"}'\n" +
+		"printf '%s\\n' '{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"conv-schedule\",\"step_index\":4,\"state\":\"ACTIVE\",\"step_type\":\"tool\",\"tool_name\":\"schedule\",\"tool_info\":{\"name\":\"schedule\",\"parameters\":{\"DurationSeconds\":\"3300\"}}}}'\n" +
+		"sleep 5\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+
+	s, err := newAntigravitySession(context.Background(), scriptPath, nil, workDir, "", "yolo", "", nil, time.Minute)
+	if err != nil {
+		t.Fatalf("newAntigravitySession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("test schedule", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case event := <-s.Events():
+			if event.Type == core.EventError {
+				if event.Error == nil || !strings.Contains(event.Error.Error(), "schedule tool is unsupported") {
+					t.Fatalf("event = %#v, want schedule rejection", event)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for schedule rejection")
+		}
+	}
+}
+
 func TestUsesInteractivePermission(t *testing.T) {
 	if !usesInteractivePermission("default") {
 		t.Fatal("default mode should use interactive permission stdin")

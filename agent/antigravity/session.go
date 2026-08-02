@@ -280,6 +280,7 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	startedTools := make(map[int]bool)
 	var terminal *core.Event
+	blockedSchedule := false
 
 	for scanner.Scan() {
 		events, sid, err := parseStreamLine(scanner.Bytes(), startedTools)
@@ -292,6 +293,22 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 			as.emit(core.Event{Type: core.EventText, SessionID: sid})
 		}
 		for _, event := range events {
+			if event.Type == core.EventToolUse && strings.EqualFold(strings.TrimSpace(event.ToolName), "schedule") {
+				// Antigravity's schedule tool stays RUNNING until its background
+				// timer fires. In headless stream-json mode that means no terminal
+				// result is emitted, so cc-connect cannot deliver a Telegram reply.
+				// Reject it at the transport boundary and direct callers to the
+				// cc-connect timer/cron facilities, which own message delivery.
+				blockedSchedule = true
+				if cmd.Process != nil {
+					_ = cmd.Process.Kill()
+				}
+				as.emit(core.Event{
+					Type:  core.EventError,
+					Error: fmt.Errorf("antigravity schedule tool is unsupported over cc-connect; use cc-connect timer or cron"),
+				})
+				break
+			}
 			if event.Type == core.EventResult {
 				eventCopy := event
 				terminal = &eventCopy
@@ -299,10 +316,16 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 			}
 			as.emit(event)
 		}
+		if blockedSchedule {
+			break
+		}
 	}
 
 	scanErr := scanner.Err()
 	waitErr := cmd.Wait()
+	if blockedSchedule {
+		return
+	}
 
 	// AGY 1.1.8 emits the conversation ID in the init event. Keep the file
 	// lookup only as a compatibility fallback for an incomplete stream.
@@ -316,6 +339,13 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 		}
 	}
 
+	if ctx.Err() == context.DeadlineExceeded {
+		as.emit(core.Event{
+			Type:  core.EventError,
+			Error: fmt.Errorf("antigravity turn timed out after %v", as.timeout),
+		})
+		return
+	}
 	if ctx.Err() != nil {
 		return
 	}
