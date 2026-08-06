@@ -942,6 +942,60 @@ func TestHandleMessagePrivateTopicUsesThreadID(t *testing.T) {
 	}
 }
 
+func TestHandleSinglePhotoDispatchesImageWithAndWithoutCaption(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "image-data")
+	}))
+	defer server.Close()
+
+	for i, caption := range []string{"", "午餐，飲料是無糖豆漿"} {
+		t.Run(fmt.Sprintf("caption-%d", i), func(t *testing.T) {
+			handled := make(chan *core.Message, 1)
+			p := &Platform{
+				token:         "token",
+				httpClient:    server.Client(),
+				groupReplyAll: true,
+			}
+			p.handler = func(_ core.Platform, msg *core.Message) {
+				handled <- msg
+			}
+			stubBot := newStubTelegramBot()
+			stubBot.fileURL = server.URL + "/file"
+			p.bot = stubBot
+			p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+			msg := &models.Message{
+				ID:      10 + i,
+				Caption: caption,
+				Photo:   []models.PhotoSize{{FileID: "photo-small"}, {FileID: "photo-large"}},
+				Date:    int(time.Now().Unix()),
+				From:    &models.User{ID: 7, Username: "alice"},
+				Chat: models.Chat{
+					ID:   100,
+					Type: models.ChatTypePrivate,
+				},
+			}
+
+			p.handleMessage(context.Background(), msg)
+
+			select {
+			case got := <-handled:
+				if got.Content != caption {
+					t.Fatalf("Content = %q, want %q", got.Content, caption)
+				}
+				if len(got.Images) != 1 {
+					t.Fatalf("Images len = %d, want 1", len(got.Images))
+				}
+				if string(got.Images[0].Data) != "image-data" || got.Images[0].MimeType != "image/jpeg" {
+					t.Fatalf("image = %#v, want downloaded JPEG", got.Images[0])
+				}
+			case <-time.After(time.Second):
+				t.Fatal("message not handled")
+			}
+		})
+	}
+}
+
 func TestHandlePhotoDispatchesCaptionWhenDownloadFails(t *testing.T) {
 	handled := make(chan *core.Message, 1)
 	p := &Platform{

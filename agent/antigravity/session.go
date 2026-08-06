@@ -127,59 +127,18 @@ func (as *antigravitySession) Send(prompt string, images []core.ImageAttachment,
 		}
 	}
 
-	// Save images and files into the workspace
-	attachDir := filepath.Join(as.workDir, ".cc-connect", "attachments")
-	if (len(images) > 0 || len(files) > 0) && os.MkdirAll(attachDir, 0o755) != nil {
-		attachDir = os.TempDir()
-	}
-
-	var imageRefs []string
-	for i, img := range images {
-		ext := ".png"
-		switch img.MimeType {
-		case "image/jpeg":
-			ext = ".jpg"
-		case "image/gif":
-			ext = ".gif"
-		case "image/webp":
-			ext = ".webp"
-		}
-		fname := fmt.Sprintf("img_%d_%d%s", time.Now().UnixMilli(), i, ext)
-		fpath := filepath.Join(attachDir, fname)
-		if err := os.WriteFile(fpath, img.Data, 0o600); err == nil {
-			imageRefs = append(imageRefs, fpath)
-		}
-	}
-
-	var fileRefs []string
-	for i, f := range files {
-		fname := filepath.Base(f.FileName)
-		if fname == "" || fname == "." || fname == ".." {
-			fname = fmt.Sprintf("file_%d_%d", time.Now().UnixMilli(), i)
-		}
-		fpath := filepath.Join(attachDir, fname)
-		if err := os.WriteFile(fpath, f.Data, 0o600); err == nil {
-			fileRefs = append(fileRefs, fpath)
-		}
-	}
+	// Persist attachments across agent turns. A resumed Antigravity conversation
+	// may decide to inspect an image only after the user follows up, so deleting
+	// these files when the current CLI process exits makes valid prompt paths
+	// immediately stale. core.SaveFilesToDisk also expires files older than the
+	// shared seven-day retention window.
+	imageRefs, fileRefs := saveAntigravityAttachments(as.workDir, images, files)
 
 	chatID := as.CurrentSessionID()
 	isResume := chatID != ""
 
 	// Attach image and file references to prompt
-	fullPrompt := prompt
-	if len(imageRefs) > 0 {
-		if fullPrompt == "" {
-			fullPrompt = "Please analyze the attached image(s)."
-		}
-		fullPrompt += "\n\n[Attached images saved at: " + strings.Join(imageRefs, ", ") + "]"
-	}
-	if len(fileRefs) > 0 {
-		if fullPrompt == "" {
-			fullPrompt = "Please analyze the attached file(s)."
-		}
-		fullPrompt += "\n\n[Attached files saved at: " + strings.Join(fileRefs, ", ") + "]"
-	}
+	fullPrompt := appendAntigravityAttachmentRefs(prompt, imageRefs, fileRefs)
 	args := as.buildAntigravityArgs(chatID, isResume, as.mode, as.model, fullPrompt)
 
 	var ctx context.Context
@@ -233,10 +192,50 @@ func (as *antigravitySession) Send(prompt string, images []core.ImageAttachment,
 	as.wg.Add(1)
 	go func() {
 		defer cancel()
-		as.readLoop(ctx, cmd, stdout, &stderrBuf, append(imageRefs, fileRefs...), preEntries, time.Now())
+		as.readLoop(ctx, cmd, stdout, &stderrBuf, preEntries, time.Now())
 	}()
 
 	return nil
+}
+
+func saveAntigravityAttachments(workDir string, images []core.ImageAttachment, files []core.FileAttachment) ([]string, []string) {
+	stamp := time.Now().UnixMilli()
+	imageFiles := make([]core.FileAttachment, 0, len(images))
+	for i, img := range images {
+		ext := ".png"
+		switch img.MimeType {
+		case "image/jpeg":
+			ext = ".jpg"
+		case "image/gif":
+			ext = ".gif"
+		case "image/webp":
+			ext = ".webp"
+		}
+		imageFiles = append(imageFiles, core.FileAttachment{
+			MimeType: img.MimeType,
+			Data:     img.Data,
+			FileName: fmt.Sprintf("img_%d_%d%s", stamp, i, ext),
+		})
+	}
+	return core.SaveFilesToDisk(workDir, imageFiles), core.SaveFilesToDisk(workDir, files)
+}
+
+func appendAntigravityAttachmentRefs(prompt string, imageRefs, fileRefs []string) string {
+	fullPrompt := prompt
+	if len(imageRefs) > 0 {
+		if fullPrompt == "" {
+			fullPrompt = "Please analyze the attached image(s)."
+		}
+		fullPrompt += "\n\n[Attached images saved at: " + strings.Join(imageRefs, ", ") + "]"
+		fullPrompt += "\n[Instruction: Inspect every attached image with view_file before responding; do not infer visual content from the filename or text alone.]"
+	}
+	if len(fileRefs) > 0 {
+		if fullPrompt == "" {
+			fullPrompt = "Please analyze the attached file(s)."
+		}
+		fullPrompt += "\n\n[Attached files saved at: " + strings.Join(fileRefs, ", ") + "]"
+	}
+	return fullPrompt
 }
 
 func (as *antigravitySession) buildAntigravityArgs(chatID string, isResume bool, mode, model, fullPrompt string) []string {
@@ -263,13 +262,8 @@ func usesInteractivePermission(mode string) bool {
 	return strings.EqualFold(strings.TrimSpace(mode), "default")
 }
 
-func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, tempFiles []string, preEntries map[string]bool, sendStartedAt time.Time) {
+func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdout io.ReadCloser, stderrBuf *bytes.Buffer, preEntries map[string]bool, sendStartedAt time.Time) {
 	defer as.wg.Done()
-	defer func() {
-		for _, f := range tempFiles {
-			_ = os.Remove(f)
-		}
-	}()
 
 	go func() {
 		<-ctx.Done()

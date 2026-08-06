@@ -90,6 +90,121 @@ func TestBuildAntigravityArgs_PromptAtEnd(t *testing.T) {
 	}
 }
 
+func TestAppendAntigravityAttachmentRefs(t *testing.T) {
+	tests := []struct {
+		name       string
+		prompt     string
+		imageRefs  []string
+		wantPieces []string
+	}{
+		{
+			name:       "single image without subject",
+			imageRefs:  []string{"/work/.cc-connect/attachments/one.jpg"},
+			wantPieces: []string{"Please analyze the attached image(s).", "one.jpg", "Inspect every attached image with view_file"},
+		},
+		{
+			name:       "single image with subject",
+			prompt:     "午餐，飲料是無糖豆漿",
+			imageRefs:  []string{"/work/.cc-connect/attachments/one.jpg"},
+			wantPieces: []string{"午餐，飲料是無糖豆漿", "one.jpg", "Inspect every attached image with view_file"},
+		},
+		{
+			name:       "multiple images with subject",
+			prompt:     "比較這兩張圖片",
+			imageRefs:  []string{"/work/.cc-connect/attachments/one.jpg", "/work/.cc-connect/attachments/two.jpg"},
+			wantPieces: []string{"比較這兩張圖片", "one.jpg", "two.jpg", "Inspect every attached image with view_file"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := appendAntigravityAttachmentRefs(tt.prompt, tt.imageRefs, nil)
+			for _, piece := range tt.wantPieces {
+				if !strings.Contains(got, piece) {
+					t.Fatalf("prompt %q does not contain %q", got, piece)
+				}
+			}
+		})
+	}
+}
+
+func TestSession_AttachmentRemainsAvailableAfterTurn(t *testing.T) {
+	workDir := t.TempDir()
+	attachDir := filepath.Join(workDir, ".cc-connect", "attachments")
+	if err := os.MkdirAll(attachDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	oldPath := filepath.Join(attachDir, "expired.jpg")
+	if err := os.WriteFile(oldPath, []byte("old"), 0o600); err != nil {
+		t.Fatalf("write expired attachment: %v", err)
+	}
+	oldTime := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(oldPath, oldTime, oldTime); err != nil {
+		t.Fatalf("age expired attachment: %v", err)
+	}
+
+	scriptPath := filepath.Join(workDir, "fake-agy")
+	argsPath := filepath.Join(workDir, "args.txt")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$@\" > \"$AGY_ARGS_FILE\"\n" +
+		"printf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"conv-image\",\"init\":{\"cwd\":\"/tmp\"}}'\n" +
+		"printf '%s\\n' '{\"event\":\"result\",\"result\":{\"conversation_id\":\"conv-image\",\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{}}}'\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+	t.Setenv("AGY_ARGS_FILE", argsPath)
+
+	s, err := newAntigravitySession(context.Background(), scriptPath, nil, workDir, "", "yolo", "", nil, time.Minute)
+	if err != nil {
+		t.Fatalf("newAntigravitySession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("午餐", []core.ImageAttachment{{MimeType: "image/jpeg", Data: []byte("image-data")}}, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case event := <-s.Events():
+			if event.Type == core.EventError {
+				t.Fatalf("unexpected error: %v", event.Error)
+			}
+			if event.Type == core.EventResult {
+				goto completed
+			}
+		case <-timeout:
+			t.Fatal("timed out waiting for result")
+		}
+	}
+
+completed:
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("expired attachment still exists: %v", err)
+	}
+	entries, err := os.ReadDir(attachDir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("attachment count = %d, want 1", len(entries))
+	}
+	imagePath := filepath.Join(attachDir, entries[0].Name())
+	data, err := os.ReadFile(imagePath)
+	if err != nil {
+		t.Fatalf("attachment was deleted after turn: %v", err)
+	}
+	if string(data) != "image-data" {
+		t.Fatalf("attachment data = %q, want image-data", data)
+	}
+	argsData, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatalf("read captured args: %v", err)
+	}
+	if !strings.Contains(string(argsData), "午餐") || !strings.Contains(string(argsData), imagePath) {
+		t.Fatalf("agy args do not contain subject and image path: %q", argsData)
+	}
+}
+
 func TestParseStreamLine_Init(t *testing.T) {
 	events, sid, err := parseStreamLine([]byte(`{"event":"init","conversation_id":"conv-1","init":{"cwd":"/tmp"}}`), map[int]bool{})
 	if err != nil {
