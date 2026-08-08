@@ -77,6 +77,41 @@ func TestParseSendArgs_UsesSessionEnvFallback(t *testing.T) {
 	}
 }
 
+// Antigravity print mode receives CC_PROJECT and CC_SESSION_KEY from the
+// engine, then invokes this exact direct-binary command shape outside its
+// terminal sandbox so it can connect to cc-connect's Unix socket. Keep image
+// delivery independent from explicit chat identifiers and flag ordering.
+func TestParseSendArgs_AntigravityImageSendUsesInjectedSession(t *testing.T) {
+	t.Setenv("CC_PROJECT", "antigravity")
+	t.Setenv("CC_SESSION_KEY", "telegram:123:456")
+
+	dir := t.TempDir()
+	imgPath := filepath.Join(dir, "hook-smoke.png")
+	if err := os.WriteFile(imgPath, []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}, 0o644); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+
+	req, _, err := parseSendArgs([]string{
+		"--image", imgPath,
+		"--message", "hook smoke test",
+	})
+	if err != nil {
+		t.Fatalf("parseSendArgs returned error: %v", err)
+	}
+	if req.Project != "antigravity" {
+		t.Fatalf("project = %q, want antigravity", req.Project)
+	}
+	if req.SessionKey != "telegram:123:456" {
+		t.Fatalf("session = %q, want telegram:123:456", req.SessionKey)
+	}
+	if req.Message != "hook smoke test" {
+		t.Fatalf("message = %q, want hook smoke test", req.Message)
+	}
+	if len(req.Images) != 1 || req.Images[0].FileName != "hook-smoke.png" {
+		t.Fatalf("images = %#v, want one hook-smoke.png", req.Images)
+	}
+}
+
 func TestParseSendArgs_WorkDirOption(t *testing.T) {
 	workDir := t.TempDir()
 
