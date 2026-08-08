@@ -323,6 +323,17 @@ func TestParseStreamLine_Result(t *testing.T) {
 	}
 }
 
+func TestCorrectedAntigravityResponseDropsUnsupportedDraft(t *testing.T) {
+	input := "[2026-08-08 10:13]\n沒有查證的舊回答\n" +
+		personalAICorrectedResponseMarker +
+		"\n[2026-08-08 10:14]\n查證後的回答\n"
+	got := correctedAntigravityResponse(input)
+	want := "[2026-08-08 10:14]\n查證後的回答"
+	if got != want {
+		t.Fatalf("corrected response = %q, want %q", got, want)
+	}
+}
+
 func TestParseStreamLine_MalformedJSON(t *testing.T) {
 	if _, _, err := parseStreamLine([]byte(`{"event":`), map[int]bool{}); err == nil {
 		t.Fatal("expected malformed JSON error")
@@ -418,13 +429,54 @@ func TestSession_TimeoutEmitsError(t *testing.T) {
 	}
 }
 
-func TestSession_ScheduleToolIsRejected(t *testing.T) {
+func TestSession_Backend503IncludesStatus(t *testing.T) {
+	homeDir := t.TempDir()
+	t.Setenv("HOME", homeDir)
+	logDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "log")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll log dir: %v", err)
+	}
+
+	workDir := t.TempDir()
+	scriptPath := filepath.Join(workDir, "fake-agy-503")
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' 'Failed request: {\"error\":{\"code\":503,\"message\":\"The service is currently unavailable.\",\"status\":\"UNAVAILABLE\"}}' > \"$HOME/.gemini/antigravity-cli/log/cli-test.log\"\n" +
+		"exit 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake agy: %v", err)
+	}
+
+	s, err := newAntigravitySession(context.Background(), scriptPath, nil, workDir, "", "yolo", "", nil, time.Minute)
+	if err != nil {
+		t.Fatalf("newAntigravitySession: %v", err)
+	}
+	defer func() { _ = s.Close() }()
+	if err := s.Send("test backend failure", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	select {
+	case event := <-s.Events():
+		if event.Type != core.EventError || event.Error == nil {
+			t.Fatalf("event = %#v, want EventError", event)
+		}
+		got := event.Error.Error()
+		if !strings.Contains(got, "503 UNAVAILABLE") || !strings.Contains(got, "Google Antigravity backend") {
+			t.Fatalf("error = %q, want concise 503 backend status", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for backend error")
+	}
+}
+
+func TestSession_DeniedScheduleDoesNotAbortTurn(t *testing.T) {
 	workDir := t.TempDir()
 	scriptPath := filepath.Join(workDir, "fake-agy-schedule")
 	script := "#!/bin/sh\n" +
 		"printf '%s\\n' '{\"event\":\"init\",\"conversation_id\":\"conv-schedule\"}'\n" +
 		"printf '%s\\n' '{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"conv-schedule\",\"step_index\":4,\"state\":\"ACTIVE\",\"step_type\":\"tool\",\"tool_name\":\"schedule\",\"tool_info\":{\"name\":\"schedule\",\"parameters\":{\"DurationSeconds\":\"3300\"}}}}'\n" +
-		"sleep 5\n"
+		"printf '%s\\n' '{\"event\":\"step_update\",\"step_update\":{\"conversation_id\":\"conv-schedule\",\"step_index\":4,\"state\":\"DONE\",\"step_type\":\"tool\",\"tool_name\":\"schedule\",\"tool_info\":{\"name\":\"schedule\",\"parameters\":{\"DurationSeconds\":\"3300\"},\"output\":{\"decision\":\"deny\"}}}}'\n" +
+		"printf '%s\\n' '{\"event\":\"result\",\"result\":{\"conversation_id\":\"conv-schedule\",\"status\":\"SUCCESS\",\"response\":\"已改用替代方案\",\"usage\":{}}}'\n"
 	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
 		t.Fatalf("write fake agy: %v", err)
 	}
@@ -438,18 +490,29 @@ func TestSession_ScheduleToolIsRejected(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 
+	var sawToolUse, sawToolResult bool
 	deadline := time.After(3 * time.Second)
 	for {
 		select {
 		case event := <-s.Events():
-			if event.Type == core.EventError {
-				if event.Error == nil || !strings.Contains(event.Error.Error(), "schedule tool is unsupported") {
-					t.Fatalf("event = %#v, want schedule rejection", event)
+			switch event.Type {
+			case core.EventToolUse:
+				sawToolUse = event.ToolName == "schedule"
+			case core.EventToolResult:
+				sawToolResult = event.ToolName == "schedule"
+			case core.EventError:
+				t.Fatalf("schedule denial aborted the turn: %v", event.Error)
+			case core.EventResult:
+				if !sawToolUse || !sawToolResult {
+					t.Fatalf("missing schedule events before result: use=%v result=%v", sawToolUse, sawToolResult)
+				}
+				if event.Content != "已改用替代方案" {
+					t.Fatalf("result content = %q", event.Content)
 				}
 				return
 			}
 		case <-deadline:
-			t.Fatal("timed out waiting for schedule rejection")
+			t.Fatal("timed out waiting for terminal result after schedule denial")
 		}
 	}
 }

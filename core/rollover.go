@@ -10,6 +10,15 @@ import (
 	"time"
 )
 
+const antigravityRolloverTurnTimeout = 3 * time.Minute
+
+func (e *Engine) antigravityRolloverTimeout() time.Duration {
+	if e.eventIdleTimeout > 0 && e.eventIdleTimeout < antigravityRolloverTurnTimeout {
+		return e.eventIdleTimeout
+	}
+	return antigravityRolloverTurnTimeout
+}
+
 const antigravityRolloverSummaryPromptFallback = `請為這個 Antigravity conversation 產生一份交接摘要，用來換到新的 session。
 
 請包含：
@@ -115,6 +124,20 @@ func (e *Engine) runAgyRollover(p Platform, replyCtx any, sessionKey, interactiv
 		e.reply(p, replyCtx, e.i18n.T(MsgFailedToStartAgentSession))
 		return
 	}
+	oldReaderRestored := false
+	defer func() {
+		if oldReaderRestored || oldUnlocked {
+			return
+		}
+		oldState.mu.Lock()
+		alive := oldState.agentSession != nil && oldState.agentSession.Alive() && !oldState.stopped && !oldState.eventsNeedResync
+		workspaceDir := oldState.workspaceDir
+		oldState.mu.Unlock()
+		if alive {
+			e.startUnsolicitedReader(oldState, oldSession, sessions, interactiveKey, workspaceDir)
+		}
+		oldReaderRestored = true
+	}()
 
 	oldID := oldSession.GetAgentSessionID()
 	steps := 0
@@ -158,6 +181,7 @@ func (e *Engine) runAgyRollover(p Platform, replyCtx any, sessionKey, interactiv
 	handoffPrompt := e.antigravityRolloverHandoffPrompt(summary)
 	ack, err := e.collectSilentAgentTurn(newState, newSession, sessions, agent, handoffPrompt)
 	if err != nil {
+		e.cleanupInteractiveState(interactiveKey, newState)
 		e.reply(p, replyCtx, fmt.Sprintf("換線失敗：建立新 session 時出錯：%v", err))
 		return
 	}
@@ -167,6 +191,14 @@ func (e *Engine) runAgyRollover(p Platform, replyCtx any, sessionKey, interactiv
 		newSession.AddHistory("assistant", strings.TrimSpace(ack))
 	}
 	sessions.Save()
+
+	newState.mu.Lock()
+	alive := newState.agentSession != nil && newState.agentSession.Alive() && !newState.stopped && !newState.eventsNeedResync
+	workspaceDir := newState.workspaceDir
+	newState.mu.Unlock()
+	if alive {
+		e.startUnsolicitedReader(newState, newSession, sessions, interactiveKey, workspaceDir)
+	}
 
 	newID := newSession.GetAgentSessionID()
 	if oldID == "" {
@@ -187,7 +219,19 @@ func (e *Engine) collectSilentAgentTurn(state *interactiveState, session *Sessio
 		return "", fmt.Errorf("agent session is not available")
 	}
 
-	drainEvents(state.agentSession.Events())
+	// A normal interactive turn leaves an unsolicited reader behind so that
+	// background agent output can still reach the platform. A rollover turn is
+	// intentionally silent and must be the only consumer of Events(); otherwise
+	// the background reader can steal the summary/result and leave rollover
+	// blocked until the global idle timeout.
+	e.stopUnsolicitedReader(state)
+	state.mu.Lock()
+	needResync := state.eventsNeedResync
+	state.eventsNeedResync = true
+	state.mu.Unlock()
+	if needResync {
+		drainEvents(state.agentSession.Events())
+	}
 
 	sendDone := make(chan error, 1)
 	go func() {
@@ -199,13 +243,9 @@ func (e *Engine) collectSilentAgentTurn(state *interactiveState, session *Sessio
 	stopCh := state.stopSignal()
 	pendingSend := sendDone
 
-	var idleTimer *time.Timer
-	var idleCh <-chan time.Time
-	if e.eventIdleTimeout > 0 {
-		idleTimer = time.NewTimer(e.eventIdleTimeout)
-		defer idleTimer.Stop()
-		idleCh = idleTimer.C
-	}
+	turnTimeout := e.antigravityRolloverTimeout()
+	turnTimer := time.NewTimer(turnTimeout)
+	defer turnTimer.Stop()
 
 	for {
 		select {
@@ -219,15 +259,6 @@ func (e *Engine) collectSilentAgentTurn(state *interactiveState, session *Sessio
 		case event, ok := <-events:
 			if !ok {
 				return "", fmt.Errorf("agent process exited")
-			}
-			if idleTimer != nil {
-				if !idleTimer.Stop() {
-					select {
-					case <-idleTimer.C:
-					default:
-					}
-				}
-				idleTimer.Reset(e.eventIdleTimeout)
 			}
 			switch event.Type {
 			case EventText:
@@ -245,6 +276,9 @@ func (e *Engine) collectSilentAgentTurn(state *interactiveState, session *Sessio
 				if result == "" && len(textParts) > 0 {
 					result = strings.TrimSpace(strings.Join(textParts, ""))
 				}
+				state.mu.Lock()
+				state.eventsNeedResync = false
+				state.mu.Unlock()
 				return result, nil
 			case EventError:
 				if event.Error != nil {
@@ -257,8 +291,8 @@ func (e *Engine) collectSilentAgentTurn(state *interactiveState, session *Sessio
 					UpdatedInput: event.ToolInputRaw,
 				})
 			}
-		case <-idleCh:
-			return "", fmt.Errorf("agent session timed out")
+		case <-turnTimer.C:
+			return "", fmt.Errorf("agent session timed out after %s", turnTimeout)
 		case <-e.ctx.Done():
 			return "", e.ctx.Err()
 		}

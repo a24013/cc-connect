@@ -44,6 +44,8 @@ type antigravitySession struct {
 
 var permissionPromptPattern = regexp.MustCompile(`(?is)(allow|approve|permission).{0,400}(\(y/n\)|\(y\/n\)|\(y\/N\)|\(Y\/n\)|\[y\/n\]|\[y\/N\]|\[Y\/n\]|yes\/no)`)
 
+const personalAICorrectedResponseMarker = "[[PERSONAL_AI_CORRECTED_RESPONSE]]"
+
 type streamEnvelope struct {
 	Event          string            `json:"event"`
 	ConversationID string            `json:"conversation_id"`
@@ -274,7 +276,6 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	startedTools := make(map[int]bool)
 	var terminal *core.Event
-	blockedSchedule := false
 
 	for scanner.Scan() {
 		events, sid, err := parseStreamLine(scanner.Bytes(), startedTools)
@@ -287,22 +288,6 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 			as.emit(core.Event{Type: core.EventText, SessionID: sid})
 		}
 		for _, event := range events {
-			if event.Type == core.EventToolUse && strings.EqualFold(strings.TrimSpace(event.ToolName), "schedule") {
-				// Antigravity's schedule tool stays RUNNING until its background
-				// timer fires. In headless stream-json mode that means no terminal
-				// result is emitted, so cc-connect cannot deliver a Telegram reply.
-				// Reject it at the transport boundary and direct callers to the
-				// cc-connect timer/cron facilities, which own message delivery.
-				blockedSchedule = true
-				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
-				}
-				as.emit(core.Event{
-					Type:  core.EventError,
-					Error: fmt.Errorf("antigravity schedule tool is unsupported over cc-connect; use cc-connect timer or cron"),
-				})
-				break
-			}
 			if event.Type == core.EventResult {
 				eventCopy := event
 				terminal = &eventCopy
@@ -310,16 +295,10 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 			}
 			as.emit(event)
 		}
-		if blockedSchedule {
-			break
-		}
 	}
 
 	scanErr := scanner.Err()
 	waitErr := cmd.Wait()
-	if blockedSchedule {
-		return
-	}
 
 	// AGY 1.1.8 emits the conversation ID in the init event. Keep the file
 	// lookup only as a compatibility fallback for an incomplete stream.
@@ -349,11 +328,9 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 	}
 	if waitErr != nil {
 		stderrMsg := strings.TrimSpace(stderrBuf.String())
-		if stderrMsg == "" {
-			stderrMsg = waitErr.Error()
-		}
+		userErr := summarizeAntigravityProcessError(stderrMsg, waitErr, sendStartedAt)
 		slog.Error("antigravitySession: process failed", "error", waitErr, "stderr", stderrMsg)
-		as.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("%s", stderrMsg)})
+		as.emit(core.Event{Type: core.EventError, Error: fmt.Errorf("%s", userErr)})
 		return
 	}
 	if terminal == nil {
@@ -367,6 +344,72 @@ func (as *antigravitySession) readLoop(ctx context.Context, cmd *exec.Cmd, stdou
 
 	terminal.SessionID = as.CurrentSessionID()
 	as.emit(*terminal)
+}
+
+var antigravityBackendErrorPattern = regexp.MustCompile(`(?s)"code"\s*:\s*(\d{3}).{0,500}?"message"\s*:\s*"([^"]+)".{0,500}?"status"\s*:\s*"([A-Z_]+)"`)
+
+// summarizeAntigravityProcessError keeps Telegram errors useful without
+// forwarding AGY's full diagnostic log, which may contain local paths or other
+// sensitive runtime details. AGY writes backend failures to its own CLI log and
+// can leave stderr as only "exit status 1".
+func summarizeAntigravityProcessError(stderr string, waitErr error, startedAt time.Time) string {
+	stderr = strings.TrimSpace(stderr)
+	if stderr != "" && stderr != waitErr.Error() {
+		return stderr
+	}
+
+	if logText := latestAntigravityLogSince(startedAt); logText != "" {
+		matches := antigravityBackendErrorPattern.FindAllStringSubmatch(logText, -1)
+		if len(matches) > 0 {
+			last := matches[len(matches)-1]
+			return fmt.Sprintf("Google Antigravity backend error: %s %s — %s", last[1], last[3], last[2])
+		}
+	}
+
+	if stderr != "" {
+		return stderr
+	}
+	return waitErr.Error()
+}
+
+func latestAntigravityLogSince(startedAt time.Time) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	logDir := filepath.Join(homeDir, ".gemini", "antigravity-cli", "log")
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return ""
+	}
+
+	var newest os.DirEntry
+	var newestTime time.Time
+	cutoff := startedAt.Add(-2 * time.Second)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "cli-") || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().Before(cutoff) || (!newestTime.IsZero() && !info.ModTime().After(newestTime)) {
+			continue
+		}
+		newest = entry
+		newestTime = info.ModTime()
+	}
+	if newest == nil {
+		return ""
+	}
+
+	data, err := os.ReadFile(filepath.Join(logDir, newest.Name()))
+	if err != nil {
+		return ""
+	}
+	const maxLogTail = 1024 * 1024
+	if len(data) > maxLogTail {
+		data = data[len(data)-maxLogTail:]
+	}
+	return string(data)
 }
 
 func parseStreamLine(line []byte, startedTools map[int]bool) ([]core.Event, string, error) {
@@ -419,7 +462,7 @@ func parseStreamLine(line []byte, startedTools map[int]bool) ([]core.Event, stri
 		}
 		event := core.Event{
 			Type:                 core.EventResult,
-			Content:              result.Response,
+			Content:              correctedAntigravityResponse(result.Response),
 			SessionID:            result.ConversationID,
 			Done:                 true,
 			InputTokens:          result.Usage.InputTokens,
@@ -431,6 +474,14 @@ func parseStreamLine(line []byte, startedTools map[int]bool) ([]core.Event, stri
 	default:
 		return nil, envelope.ConversationID, nil
 	}
+}
+
+func correctedAntigravityResponse(response string) string {
+	idx := strings.LastIndex(response, personalAICorrectedResponseMarker)
+	if idx < 0 {
+		return response
+	}
+	return strings.TrimSpace(response[idx+len(personalAICorrectedResponseMarker):])
 }
 
 func parseSubagentStep(update *streamStepUpdate, startedTools map[int]bool) []core.Event {
