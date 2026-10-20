@@ -1867,6 +1867,8 @@ func reloadConfig(configPath, projName string, engine *core.Engine) (*core.Confi
 		engine.SetUserRoles(nil)
 	}
 
+	engine.RefreshPlatformCapabilities()
+
 	slog.Info("config reloaded", "project", projName)
 	return result, nil
 }

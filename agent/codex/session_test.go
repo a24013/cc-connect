@@ -279,6 +279,10 @@ func TestCodexPromptPreamble_EmptyIsNoop(t *testing.T) {
 }
 
 func TestGetModelAndReasoningEffort_FromRuntimeConfigWhenUnset(t *testing.T) {
+	oldRuntimeConfigTimeout := codexRuntimeConfigTimeout
+	codexRuntimeConfigTimeout = 5 * time.Second
+	t.Cleanup(func() { codexRuntimeConfigTimeout = oldRuntimeConfigTimeout })
+
 	workDir := t.TempDir()
 	binDir := filepath.Join(workDir, "bin")
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
@@ -529,6 +533,59 @@ func TestSend_UsesStdinForMultilinePrompt(t *testing.T) {
 	// cat > file creates the path before stdin is fully read; polling until
 	// content matches avoids racing an empty read (flaky under -cover / CI).
 	waitForFileEquals(t, stdinFile, prompt)
+}
+
+func TestSend_RetriesOnceWhenCodexFailsBeforeThreadCreation(t *testing.T) {
+	workDir := t.TempDir()
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatalf("mkdir bin: %v", err)
+	}
+
+	attemptsFile := filepath.Join(workDir, "attempts.txt")
+	script := "#!/bin/sh\n" +
+		"cat >/dev/null\n" +
+		"printf 'attempt\\n' >> \"$CODEX_ATTEMPTS_FILE\"\n" +
+		"count=$(wc -l < \"$CODEX_ATTEMPTS_FILE\")\n" +
+		"if [ \"$count\" -eq 1 ]; then\n" +
+		"  printf '%s\\n' 'required MCP servers failed to initialize' >&2\n" +
+		"  exit 1\n" +
+		"fi\n" +
+		"printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"thread-after-retry\"}'\n" +
+		"printf '%s\\n' '{\"type\":\"turn.completed\"}'\n"
+	powershellScript := `
+[Console]::In.ReadToEnd() | Out-Null
+Add-Content -Path $env:CODEX_ATTEMPTS_FILE -Value 'attempt'
+$count = (Get-Content -Path $env:CODEX_ATTEMPTS_FILE).Count
+if ($count -eq 1) {
+  [Console]::Error.WriteLine('required MCP servers failed to initialize')
+  exit 1
+}
+[Console]::Out.WriteLine('{"type":"thread.started","thread_id":"thread-after-retry"}')
+[Console]::Out.WriteLine('{"type":"turn.completed"}')
+`
+	writeFakeCodexScript(t, binDir, script, powershellScript)
+
+	t.Setenv("CODEX_ATTEMPTS_FILE", attemptsFile)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldRetryDelay := codexStartupRetryDelay
+	codexStartupRetryDelay = 0
+	t.Cleanup(func() { codexStartupRetryDelay = oldRetryDelay })
+
+	cs, err := newCodexSession(context.Background(), "codex", nil, workDir, "", "", "", "", "", nil, "", "", "")
+	if err != nil {
+		t.Fatalf("newCodexSession: %v", err)
+	}
+	defer cs.Close()
+
+	if err := cs.Send("hello", "", nil, nil); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	waitForDoneResult(t, cs.Events())
+	waitForFileLines(t, attemptsFile, 2)
+	if got := cs.CurrentSessionID(); got != "thread-after-retry" {
+		t.Fatalf("CurrentSessionID() = %q, want thread-after-retry", got)
+	}
 }
 
 func TestSend_PrependsProjectPromptOnFreshSession(t *testing.T) {

@@ -946,6 +946,39 @@ func TestEngine_LifecycleCallbacksIgnoredAfterStopBegins(t *testing.T) {
 	}
 }
 
+func TestEngine_RefreshPlatformCapabilitiesRepublishesCommands(t *testing.T) {
+	p := &stubLifecyclePlatform{stubPlatformEngine: stubPlatformEngine{n: "telegram"}}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.AddCommand("first", "first command", "", "", "", "test")
+
+	if err := e.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer e.Stop()
+
+	e.OnPlatformReady(p)
+	if p.registerCalls != 1 {
+		t.Fatalf("registerCalls after ready = %d, want 1", p.registerCalls)
+	}
+
+	e.AddCommand("second", "second command", "", "", "", "test")
+	e.RefreshPlatformCapabilities()
+
+	if p.registerCalls != 2 {
+		t.Fatalf("registerCalls after refresh = %d, want 2", p.registerCalls)
+	}
+	var found bool
+	for _, cmd := range p.registeredCommands {
+		if cmd.Command == "second" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("refreshed command menu missing second command: %+v", p.registeredCommands)
+	}
+}
+
 func TestEngine_StopDoesNotWaitForBlockedPlatformCapabilityInit(t *testing.T) {
 	p := newBlockingRegisterPlatform("telegram")
 	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
@@ -1655,6 +1688,98 @@ func TestProcessInteractiveEvents_ToolMessagesDisabledSuppressesToolProgressOnly
 	}
 	if sent[len(sent)-1] != "done" {
 		t.Fatalf("final message = %q, want done", sent[len(sent)-1])
+	}
+}
+
+func TestProcessInteractiveEvents_AuthoritativeResultReplacesCorruptStreamText(t *testing.T) {
+	p := &stubPlatformEngine{n: "telegram"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{ThinkingMessages: false, ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: false})
+	sessionKey := "telegram:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	agentSession.events <- Event{Type: EventText, Content: "今天真的���大進步"}
+	agentSession.events <- Event{
+		Type:    EventResult,
+		Content: "今天真的是大進步",
+		Done:    true,
+		Metadata: map[string]any{
+			"authoritative_response": true,
+		},
+	}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+
+	sent := p.getSent()
+	if len(sent) != 1 || sent[0] != "今天真的是大進步" {
+		t.Fatalf("sent = %#v, want authoritative terminal response", sent)
+	}
+	history := session.GetHistory(1)
+	if len(history) != 1 || history[0].Content != "今天真的是大進步" {
+		t.Fatalf("history = %#v, want authoritative terminal response", history)
+	}
+}
+
+func TestProcessInteractiveEvents_AuthoritativeResultBuffersProvisionalTextAcrossHiddenTool(t *testing.T) {
+	p := &stubPlatformEngine{n: "telegram"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+	e.SetDisplayConfig(DisplayCfg{ThinkingMessages: false, ThinkingMaxLen: 300, ToolMaxLen: 500, ToolMessages: false})
+	sessionKey := "telegram:user1"
+	session := e.sessions.GetOrCreateActive(sessionKey)
+	agentSession := newControllableSession("s1")
+	state := &interactiveState{
+		agentSession: agentSession,
+		platform:     p,
+		replyCtx:     "ctx-1",
+	}
+	e.interactiveStates[sessionKey] = state
+
+	provisional := map[string]any{EventMetadataAuthoritativeResponsePending: true}
+	agentSession.events <- Event{
+		Type:     EventText,
+		Content:  "今天真的���大進步",
+		Metadata: provisional,
+	}
+	agentSession.events <- Event{
+		Type:      EventToolUse,
+		ToolName:  "memory_search",
+		ToolInput: "yesterday",
+	}
+	agentSession.events <- Event{
+		Type:       EventToolResult,
+		ToolName:   "memory_search",
+		ToolResult: "verified",
+	}
+	agentSession.events <- Event{
+		Type:     EventText,
+		Content:  "今天真的是大進步",
+		Metadata: provisional,
+	}
+	agentSession.events <- Event{
+		Type:    EventResult,
+		Content: "今天真的是大進步",
+		Done:    true,
+		Metadata: map[string]any{
+			"authoritative_response": true,
+		},
+	}
+
+	e.processInteractiveEvents(state, session, e.sessions, sessionKey, "m1", time.Now(), nil, nil, nil)
+
+	sent := p.getSent()
+	if len(sent) != 1 || sent[0] != "今天真的是大進步" {
+		t.Fatalf("sent = %#v, want only authoritative terminal response", sent)
+	}
+	history := session.GetHistory(1)
+	if len(history) != 1 || history[0].Content != "今天真的是大進步" {
+		t.Fatalf("history = %#v, want authoritative terminal response", history)
 	}
 }
 
@@ -11313,6 +11438,42 @@ func TestRunShellWithProgress_BasicOutput(t *testing.T) {
 			t.Fatal("timed out waiting for shell response")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRunShellWithProgress_CustomLabelDoesNotExposeCommand(t *testing.T) {
+	p := &stubPlatformEngine{n: "test"}
+	e := NewEngine("test", &stubAgent{}, []Platform{p}, "", LangEnglish)
+
+	const secret = "credential-must-not-appear"
+	command := "PRIVATE_TOKEN=" + secret + "; sleep 0.6; echo safe-output"
+	if runtime.GOOS == "windows" {
+		command = "$env:PRIVATE_TOKEN='" + secret + "'; Start-Sleep -Milliseconds 600; Write-Output safe-output"
+	}
+
+	err := e.runShellWithProgressLabel(p, "ctx", command, "/food", true, t.TempDir(), 5*time.Second, 4000)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	sent := p.getSent()
+	if len(sent) == 0 {
+		t.Fatal("expected progress or final shell response")
+	}
+	for _, message := range sent {
+		if strings.Contains(message, secret) {
+			t.Fatalf("secret leaked in shell response: %q", message)
+		}
+		if strings.Contains(message, "PRIVATE_TOKEN") {
+			t.Fatalf("command implementation leaked in shell response: %q", message)
+		}
+	}
+	last := sent[len(sent)-1]
+	if last != "safe-output" {
+		t.Fatalf("expected plain command output only, got %q", last)
+	}
+	if strings.Contains(last, "```") || strings.Contains(last, "`/food`") {
+		t.Fatalf("expected no code block or command label, got %q", last)
 	}
 }
 

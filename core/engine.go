@@ -540,6 +540,7 @@ type interactiveState struct {
 	pendingProviderAdd       *pendingProviderAddState
 	lastAutoCompressAt       time.Time
 	lastAutoCompressTokens   int
+	lastRolloverReminder     int
 
 	// Unsolicited event reader: a background goroutine that consumes agent
 	// events between user-initiated turns (e.g. background task completions).
@@ -2456,6 +2457,23 @@ func (e *Engine) initPlatformCapabilities(p Platform) {
 
 	if nav, ok := p.(CardNavigable); ok {
 		nav.SetCardNavigationHandler(e.handleCardNav)
+	}
+}
+
+// RefreshPlatformCapabilities re-publishes platform capabilities that can change
+// at runtime, such as custom command menus after a config reload.
+func (e *Engine) RefreshPlatformCapabilities() {
+	e.platformLifecycleMu.Lock()
+	var ready []Platform
+	for p, ok := range e.platformReady {
+		if ok {
+			ready = append(ready, p)
+		}
+	}
+	e.platformLifecycleMu.Unlock()
+
+	for _, p := range ready {
+		e.initPlatformCapabilities(p)
 	}
 }
 
@@ -4848,6 +4866,12 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 	events := state.agentSession.Events()
 	stopCh := state.stopSignal()
+	// Some adapters stream provisional text deltas and provide a clean,
+	// authoritative terminal result. Once such a delta appears, keep all answer
+	// text buffered across thinking, tool and permission boundaries. Otherwise a
+	// hidden validation tool can leak the unsupported draft (and any malformed
+	// UTF-8 replacement runes) before the authoritative correction arrives.
+	authoritativeResponsePending := false
 	for {
 		var event Event
 		var ok bool
@@ -5036,7 +5060,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When thinking messages are hidden, behavior depends on display mode:
 			//   quiet:   append separator to keep all text in one card
 			//   compact: freeze+detach to split text into separate cards
-			if !e.display.ThinkingMessages && len(textParts) > segmentStart {
+			if !authoritativeResponsePending && !e.display.ThinkingMessages && len(textParts) > segmentStart {
 				if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
@@ -5067,7 +5091,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// --- Original path (fallback) ---
 				// Flush accumulated text segment before thinking display
 				previewActive := sp.canPreview()
-				if len(textParts) > segmentStart {
+				if !authoritativeResponsePending && len(textParts) > segmentStart {
 					if !previewActive {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
@@ -5123,7 +5147,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool messages are hidden, behavior depends on display mode:
 			//   quiet:   append separator to keep all text in one card
 			//   compact: freeze+detach to split text into separate cards
-			if !e.display.ToolMessages && len(textParts) > segmentStart {
+			if !authoritativeResponsePending && !e.display.ToolMessages && len(textParts) > segmentStart {
 				if e.display.Mode == "quiet" {
 					if sp.canPreview() && sp.appendSeparator("\n\n") {
 						textParts = append(textParts, "\n\n")
@@ -5175,7 +5199,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				// --- Original path (fallback) ---
 				// Flush accumulated text segment before tool display
 				previewActive := sp.canPreview()
-				if len(textParts) > segmentStart {
+				if !authoritativeResponsePending && len(textParts) > segmentStart {
 					if !previewActive {
 						segment := strings.Join(textParts[segmentStart:], "")
 						if segment != "" {
@@ -5273,6 +5297,9 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				content = stripAgentFooterLines(content)
 			}
 			if content != "" && !isEllipsisOnly(content) {
+				if pending, _ := event.Metadata[EventMetadataAuthoritativeResponsePending].(bool); pending {
+					authoritativeResponsePending = true
+				}
 				// Pre-compute silentHold transition including this chunk so the
 				// rich-card path doesn't leak a preview that gets recalled at
 				// end-of-stream when the text resolves to bare NO_REPLY (Lark
@@ -5288,7 +5315,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				handledByStreamCard := false
 				if streamCard != nil && !streamCard.Failed() {
 					textParts = append(textParts, content) // always accumulate for history
-					if !silentHold {
+					if !authoritativeResponsePending && !silentHold {
 						if releasedNow {
 							cardAnswerText.WriteString(peekSegment)
 						} else {
@@ -5300,7 +5327,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				}
 				if !handledByStreamCard {
 					if len(textParts) == 0 {
-						if hasRichCard {
+						if hasRichCard && !authoritativeResponsePending {
 							if cardMessageID == nil && !silentHold {
 								card := buildResolvedRichCard(CardStatusWorking, "", toolSteps, partialText, true, e.composeRichStatusFooter(true, turnStart, e.agent, state.agentSession, state.workspaceDir))
 								if starter, ok := p.(PreviewStarter); ok {
@@ -5318,7 +5345,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 					}
 					textParts = append(textParts, content)
 					partialText += content
-					if hasRichCard {
+					if hasRichCard && !authoritativeResponsePending {
 						if !silentHold {
 							// Lazy creation: if we held during the first text events and
 							// only released this chunk, the initial-create branch above
@@ -5374,7 +5401,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 							}
 						}
 					} else {
-						if !silentHold && sp.canPreview() {
+						if !authoritativeResponsePending && !silentHold && sp.canPreview() {
 							if releasedNow {
 								sp.appendText(peekSegment) // flush all held chunks at once
 							} else {
@@ -5427,7 +5454,7 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 
 			// Flush accumulated text segment before permission prompt
 			previewActive := sp.canPreview()
-			if len(textParts) > segmentStart {
+			if !authoritativeResponsePending && len(textParts) > segmentStart {
 				if !previewActive {
 					segment := strings.Join(textParts[segmentStart:], "")
 					if segment != "" {
@@ -5545,7 +5572,11 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			// When tool progress is hidden, segmentStart stays 0 and textParts
 			// contains ALL text across tool boundaries. Prefer the full accumulated
 			// text over event.Content which only contains the last assistant segment.
-			if len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
+			// Some adapters (such as AGY stream-json) mark terminal result.response
+			// as authoritative because streamed text deltas may split malformed UTF-8
+			// boundaries. In that case the exact terminal response must win.
+			authoritativeResponse, _ := event.Metadata["authoritative_response"].(bool)
+			if !authoritativeResponse && len(textParts) > 0 && segmentStart == 0 && !e.display.ToolMessages {
 				fullResponse = strings.Join(textParts, "")
 			} else if fullResponse == "" && len(textParts) > 0 {
 				fullResponse = strings.Join(textParts, "")
@@ -5840,6 +5871,8 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 			} else {
 				slog.Debug("tts: not enabled", "tts_nil", e.tts == nil, "enabled", e.tts != nil && e.tts.Enabled, "tts_obj_nil", e.tts == nil || e.tts.TTS == nil)
 			}
+
+			e.maybeSendRolloverReminder(p, replyCtx, replyAgent, state)
 
 			// Auto-compress after finishing a turn, before sending any queued messages.
 			if triggerAutoCompress {
@@ -6300,6 +6333,7 @@ var builtinCommands = []struct {
 	{[]string{"timer", "at", "remind"}, "timer"},
 	{[]string{"heartbeat", "hb"}, "heartbeat"},
 	{[]string{"compress", "compact"}, "compress"},
+	{[]string{"rollover_agy", "rollover"}, "rollover_agy"},
 	{[]string{"stop"}, "stop"},
 	{[]string{"cancel"}, "cancel"},
 	{[]string{"help"}, "help"},
@@ -6519,6 +6553,8 @@ func (e *Engine) handleCommand(p Platform, msg *Message, raw string) bool {
 		e.cmdHeartbeat(p, msg, args)
 	case "compress":
 		e.cmdCompress(p, msg)
+	case "rollover_agy":
+		e.cmdAgyRollover(p, msg)
 	case "stop":
 		e.cmdStop(p, msg)
 	case "cancel":
@@ -7776,7 +7812,14 @@ func defaultShellFlag() string {
 // just send the result directly (no intermediate messages). If it's still running,
 // send a progress message and keep updating until completion.
 func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, workDir string, timeout time.Duration, maxOutput int) error {
-	cmdLabel := truncateStr(command, 60)
+	return e.runShellWithProgressLabel(p, replyCtx, command, command, false, workDir, timeout, maxOutput)
+}
+
+// runShellWithProgressLabel executes command while using a separate, safe
+// display label. Config-defined commands may contain inline credentials or
+// other private implementation details that must never be echoed to chat.
+func (e *Engine) runShellWithProgressLabel(p Platform, replyCtx any, command, displayLabel string, plainOutput bool, workDir string, timeout time.Duration, maxOutput int) error {
+	cmdLabel := truncateStr(displayLabel, 60)
 
 	ctx, cancel := context.WithTimeout(e.ctx, timeout)
 	defer cancel()
@@ -7795,7 +7838,11 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 
 	if err := cmd.Start(); err != nil {
 		errMsg := fmt.Sprintf("failed to start command: %v", err)
-		e.reply(p, replyCtx, fmt.Sprintf("❌ `%s`\n```\n%s\n```", cmdLabel, errMsg))
+		if plainOutput {
+			e.reply(p, replyCtx, fmt.Sprintf("❌ %s\n\n%s", cmdLabel, errMsg))
+		} else {
+			e.reply(p, replyCtx, fmt.Sprintf("❌ `%s`\n```\n%s\n```", cmdLabel, errMsg))
+		}
 		return err
 	}
 
@@ -7833,14 +7880,14 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 	select {
 	case <-doneCh:
 		// Command finished within the quick window — send result directly
-		return e.finishShellCmd(p, replyCtx, cmd, &mu, &buf, cmdLabel, maxOutput, false, cmdWaitErr)
+		return e.finishShellCmd(p, replyCtx, cmd, &mu, &buf, cmdLabel, maxOutput, plainOutput, false, cmdWaitErr)
 	case <-ctx.Done():
 		// Timeout before even the quick window elapsed (very short timeout)
 		killAndWait(cmd, doneCh)
 		mu.Lock()
 		output := buf.String()
 		mu.Unlock()
-		e.send(p, replyCtx, e.formatShellTimeout(cmdLabel, output, maxOutput))
+		e.send(p, replyCtx, e.formatShellTimeout(cmdLabel, output, maxOutput, plainOutput))
 		return fmt.Errorf("command timed out after %s", timeout)
 	case <-time.After(quickFinishTimeout):
 		// Still running — fall through to progress mode
@@ -7854,7 +7901,7 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 			mu.Lock()
 			output := buf.String()
 			mu.Unlock()
-			progressMsg := e.formatShellProgress(cmdLabel, output, maxOutput)
+			progressMsg := e.formatShellProgress(cmdLabel, output, maxOutput, plainOutput)
 			handle, err := starter.SendPreviewStart(e.ctx, replyCtx, progressMsg)
 			if err == nil && handle != nil {
 				previewHandle = handle
@@ -7880,7 +7927,7 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 					mu.Lock()
 					output := buf.String()
 					mu.Unlock()
-					msg := e.formatShellProgress(cmdLabel, output, maxOutput)
+					msg := e.formatShellProgress(cmdLabel, output, maxOutput, plainOutput)
 					_ = updaterFor(p).UpdateMessage(e.ctx, previewHandle, msg)
 				case <-updateDone:
 					return
@@ -7895,14 +7942,14 @@ func (e *Engine) runShellWithProgress(p Platform, replyCtx any, command string, 
 	select {
 	case <-doneCh:
 		close(updateDone)
-		return e.finishShellCmd(p, replyCtx, cmd, &mu, &buf, cmdLabel, maxOutput, useUpdate, previewHandle, cmdWaitErr)
+		return e.finishShellCmd(p, replyCtx, cmd, &mu, &buf, cmdLabel, maxOutput, plainOutput, useUpdate, previewHandle, cmdWaitErr)
 	case <-ctx.Done():
 		close(updateDone)
 		killAndWait(cmd, doneCh)
 		mu.Lock()
 		output := buf.String()
 		mu.Unlock()
-		timeoutMsg := e.formatShellTimeout(cmdLabel, output, maxOutput)
+		timeoutMsg := e.formatShellTimeout(cmdLabel, output, maxOutput, plainOutput)
 		if useUpdate {
 			_ = updaterFor(p).UpdateMessage(e.ctx, previewHandle, timeoutMsg)
 		} else {
@@ -7923,7 +7970,7 @@ func truncateRunes(s string, max int) string {
 	return string(runes[:max-3]) + "..."
 }
 
-func (e *Engine) finishShellCmd(p Platform, replyCtx any, cmd *exec.Cmd, mu *sync.Mutex, buf *bytes.Buffer, cmdLabel string, maxOutput int, opts ...any) error {
+func (e *Engine) finishShellCmd(p Platform, replyCtx any, cmd *exec.Cmd, mu *sync.Mutex, buf *bytes.Buffer, cmdLabel string, maxOutput int, plainOutput bool, opts ...any) error {
 	var waitErr error
 	// Extract waitErr from opts if provided as the last error argument.
 	for _, o := range opts {
@@ -7947,14 +7994,22 @@ func (e *Engine) finishShellCmd(p Platform, replyCtx any, cmd *exec.Cmd, mu *syn
 
 	var finalMsg string
 	if exitOK {
-		finalMsg = fmt.Sprintf("✅ `%s`\n```\n%s\n```", cmdLabel, display)
+		if plainOutput {
+			finalMsg = display
+		} else {
+			finalMsg = fmt.Sprintf("✅ `%s`\n```\n%s\n```", cmdLabel, display)
+		}
 	} else {
 		// Prefer the wait error message when we have no captured output,
 		// since it often contains the actual failure reason.
 		if display == "" && waitErr != nil {
 			display = truncateRunes(waitErr.Error(), maxOutput)
 		}
-		finalMsg = fmt.Sprintf("❌ `%s` (exit code %d)\n```\n%s\n```", cmdLabel, exitCode, display)
+		if plainOutput {
+			finalMsg = fmt.Sprintf("❌ %s (exit code %d)\n\n%s", cmdLabel, exitCode, display)
+		} else {
+			finalMsg = fmt.Sprintf("❌ `%s` (exit code %d)\n```\n%s\n```", cmdLabel, exitCode, display)
+		}
 	}
 
 	// opts: [useUpdate bool, previewHandle any]
@@ -7978,13 +8033,25 @@ func (e *Engine) finishShellCmd(p Platform, replyCtx any, cmd *exec.Cmd, mu *syn
 	return nil
 }
 
-func (e *Engine) formatShellProgress(cmdLabel, output string, maxOutput int) string {
+func (e *Engine) formatShellProgress(cmdLabel, output string, maxOutput int, plainOutput bool) string {
 	display := truncateRunes(output, maxOutput)
+	if plainOutput {
+		if strings.TrimSpace(display) == "" {
+			return fmt.Sprintf("⏳ %s", cmdLabel)
+		}
+		return fmt.Sprintf("⏳ %s\n\n%s", cmdLabel, display)
+	}
 	return fmt.Sprintf("⏳ `%s`\n```\n%s\n```", cmdLabel, display)
 }
 
-func (e *Engine) formatShellTimeout(cmdLabel, output string, maxOutput int) string {
+func (e *Engine) formatShellTimeout(cmdLabel, output string, maxOutput int, plainOutput bool) string {
 	display := truncateRunes(output, maxOutput)
+	if plainOutput {
+		if strings.TrimSpace(display) == "" {
+			return fmt.Sprintf("⚠️ %s (timeout)", cmdLabel)
+		}
+		return fmt.Sprintf("⚠️ %s (timeout)\n\n%s", cmdLabel, display)
+	}
 	return fmt.Sprintf("⚠️ `%s` (timeout)\n```\n%s\n```", cmdLabel, display)
 }
 
@@ -14540,7 +14607,6 @@ func (e *Engine) executeCustomCommand(p Platform, msg *Message, cmd *CustomComma
 func (e *Engine) executeShellCommand(p Platform, msg *Message, cmd *CustomCommand, args []string) {
 	slog.Info("executing shell command",
 		"command", cmd.Name,
-		"exec", cmd.Exec,
 		"user", msg.UserName,
 	)
 
@@ -14561,7 +14627,7 @@ func (e *Engine) executeShellCommand(p Platform, msg *Message, cmd *CustomComman
 		workDir, _ = os.Getwd()
 	}
 
-	_ = e.runShellWithProgress(p, msg.ReplyCtx, execCmd, workDir, 60*time.Second, 4000)
+	_ = e.runShellWithProgressLabel(p, msg.ReplyCtx, execCmd, "/"+cmd.Name, true, workDir, 60*time.Second, 4000)
 }
 
 func (e *Engine) cmdCommands(p Platform, msg *Message, args []string) {

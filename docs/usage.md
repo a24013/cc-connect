@@ -807,6 +807,7 @@ Notes:
 - The files must exist on the local machine where the agent runs.
 - There must be an active session; otherwise the command fails because cc-connect has no chat context to deliver to.
 - The target platform also enforces its own file-size/type limit at delivery; the effective per-attachment ceiling is the smaller of that limit and `max_attachment_size_mb` (a file that passes cc-connect may still be rejected by the platform).
+- In headless Antigravity `proceed-in-sandbox` mode, Unix socket `connect()` is blocked even when the socket directory is added to the workspace. Keep the direct command shape `cc-connect send ...`, run only that command with `BypassSandbox=true`, and add the narrow `unsandboxed(cc-connect send)` allow rule. Do not disable the sandbox for the whole agent session.
 
 ---
 

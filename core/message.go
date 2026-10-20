@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 // platform boundary rejects their identity. Keep it user-facing: do not mention
 // allow_from, user IDs, or chat IDs.
 const UnauthorizedAccessMessage = "角色未授权，请联系管理员添加权限。"
+
+const attachmentTTL = 7 * 24 * time.Hour
 
 // MergeEnv returns base env with entries from extra overriding same-key entries.
 // This prevents duplicate keys (e.g. two PATH entries) which cause the override
@@ -186,6 +189,7 @@ func SaveFilesToDisk(workDir, messageID string, files []FileAttachment) []string
 	if err := os.MkdirAll(attachDir, 0o755); err != nil {
 		slog.Warn("SaveFilesToDisk: mkdir failed", "dir", attachDir, "error", err)
 	}
+	cleanupExpiredAttachments(attachDir, attachmentTTL)
 
 	var paths []string
 	for i, f := range files {
@@ -308,6 +312,36 @@ func sanitizeAttachmentFileName(name string) string {
 		return ""
 	}
 	return name
+}
+
+func cleanupExpiredAttachments(dir string, ttl time.Duration) {
+	if ttl <= 0 {
+		return
+	}
+	cutoff := time.Now().Add(-ttl)
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			slog.Debug("SaveFilesToDisk: cleanup walk failed", "path", path, "error", err)
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			slog.Debug("SaveFilesToDisk: cleanup stat failed", "path", path, "error", err)
+			return nil
+		}
+		if info.ModTime().Before(cutoff) {
+			if err := os.Remove(path); err != nil {
+				slog.Debug("SaveFilesToDisk: cleanup remove failed", "path", path, "error", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		slog.Debug("SaveFilesToDisk: cleanup failed", "dir", dir, "error", err)
+	}
 }
 
 // AppendFileRefs appends file path references to a prompt string.
@@ -451,6 +485,11 @@ type Event struct {
 	Metadata                 map[string]any // optional metadata from agent (e.g. compaction_continue)
 	Synthetic                bool           // true if this is a synthetic/generated message (not from real user)
 }
+
+// EventMetadataAuthoritativeResponsePending marks streamed text as provisional.
+// Adapters that provide a clean authoritative terminal result use this to prevent
+// the engine from surfacing incomplete or malformed deltas at tool boundaries.
+const EventMetadataAuthoritativeResponsePending = "authoritative_response_pending"
 
 // HistoryEntry is one turn in a conversation.
 type HistoryEntry struct {

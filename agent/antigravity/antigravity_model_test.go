@@ -2,6 +2,7 @@ package antigravity
 
 import (
 	"testing"
+	"time"
 
 	"github.com/chenhg5/cc-connect/core"
 )
@@ -53,5 +54,28 @@ func TestGetModel_PrefersActiveProviderModel(t *testing.T) {
 
 	if got := a.GetModel(); got != "gemini-2.5-pro" {
 		t.Fatalf("GetModel() = %q, want gemini-2.5-pro", got)
+	}
+}
+
+func TestNewAcceptsLegacyPrintTimeout(t *testing.T) {
+	created, err := New(map[string]any{
+		"cmd":           "true",
+		"print_timeout": "3m",
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	agent := created.(*Agent)
+	if agent.timeout != 3*time.Minute {
+		t.Fatalf("timeout = %v, want 3m", agent.timeout)
+	}
+}
+
+func TestNewRejectsInvalidLegacyPrintTimeout(t *testing.T) {
+	if _, err := New(map[string]any{
+		"cmd":           "true",
+		"print_timeout": "not-a-duration",
+	}); err == nil {
+		t.Fatal("expected invalid print_timeout error")
 	}
 }

@@ -86,6 +86,7 @@ type stubTelegramBot struct {
 	sendErr    error
 	getFileErr error
 	file       *models.File
+	fileURL    string
 }
 
 func newStubTelegramBot() *stubTelegramBot {
@@ -202,6 +203,9 @@ func (b *stubTelegramBot) GetFile(_ context.Context, _ *tgbot.GetFileParams) (*m
 }
 
 func (b *stubTelegramBot) FileDownloadLink(f *models.File) string {
+	if b.fileURL != "" {
+		return b.fileURL
+	}
 	return "https://test.example.com/file/" + f.FilePath
 }
 
@@ -938,6 +942,205 @@ func TestHandleMessagePrivateTopicUsesThreadID(t *testing.T) {
 	}
 }
 
+func TestHandleSinglePhotoDispatchesImageWithAndWithoutCaption(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "image-data")
+	}))
+	defer server.Close()
+
+	for i, caption := range []string{"", "午餐，飲料是無糖豆漿"} {
+		t.Run(fmt.Sprintf("caption-%d", i), func(t *testing.T) {
+			handled := make(chan *core.Message, 1)
+			p := &Platform{
+				token:         "token",
+				httpClient:    server.Client(),
+				groupReplyAll: true,
+			}
+			p.handler = func(_ core.Platform, msg *core.Message) {
+				handled <- msg
+			}
+			stubBot := newStubTelegramBot()
+			stubBot.fileURL = server.URL + "/file"
+			p.bot = stubBot
+			p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+			msg := &models.Message{
+				ID:      10 + i,
+				Caption: caption,
+				Photo:   []models.PhotoSize{{FileID: "photo-small"}, {FileID: "photo-large"}},
+				Date:    int(time.Now().Unix()),
+				From:    &models.User{ID: 7, Username: "alice"},
+				Chat: models.Chat{
+					ID:   100,
+					Type: models.ChatTypePrivate,
+				},
+			}
+
+			p.handleMessage(context.Background(), msg)
+
+			select {
+			case got := <-handled:
+				if got.Content != caption {
+					t.Fatalf("Content = %q, want %q", got.Content, caption)
+				}
+				if len(got.Images) != 1 {
+					t.Fatalf("Images len = %d, want 1", len(got.Images))
+				}
+				if string(got.Images[0].Data) != "image-data" || got.Images[0].MimeType != "image/jpeg" {
+					t.Fatalf("image = %#v, want downloaded JPEG", got.Images[0])
+				}
+			case <-time.After(time.Second):
+				t.Fatal("message not handled")
+			}
+		})
+	}
+}
+
+func TestHandlePhotoDispatchesCaptionWhenDownloadFails(t *testing.T) {
+	handled := make(chan *core.Message, 1)
+	p := &Platform{
+		token:         "token",
+		httpClient:    &http.Client{},
+		groupReplyAll: true,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.getFileErr = errors.New("telegram timeout")
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	msg := &models.Message{
+		ID:      10,
+		Caption: "please inspect this",
+		Photo:   []models.PhotoSize{{FileID: "photo-small"}, {FileID: "photo-large"}},
+		Date:    int(time.Now().Unix()),
+		From:    &models.User{ID: 7, Username: "alice"},
+		Chat: models.Chat{
+			ID:   100,
+			Type: models.ChatTypePrivate,
+		},
+	}
+
+	p.handleMessage(context.Background(), msg)
+
+	select {
+	case got := <-handled:
+		if !strings.Contains(got.Content, "please inspect this") {
+			t.Fatalf("Content = %q, want caption to be preserved", got.Content)
+		}
+		if !strings.Contains(got.Content, "image download failed") {
+			t.Fatalf("Content = %q, want download failure note", got.Content)
+		}
+		if len(got.Images) != 0 {
+			t.Fatalf("Images len = %d, want 0", len(got.Images))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("message not handled")
+	}
+
+	if got := stubBot.GetFileCallCount(); got != telegramFileRetries {
+		t.Fatalf("GetFile calls = %d, want %d", got, telegramFileRetries)
+	}
+}
+
+func TestHandlePhotoAlbumDispatchesOnePromptWithAllImages(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "image-data")
+	}))
+	defer server.Close()
+
+	handled := make(chan *core.Message, 2)
+	p := &Platform{
+		token:         "token",
+		httpClient:    server.Client(),
+		groupReplyAll: true,
+		albumDebounce: 20 * time.Millisecond,
+	}
+	p.handler = func(_ core.Platform, msg *core.Message) {
+		handled <- msg
+	}
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL + "/file"
+	p.bot = stubBot
+	p.selfUser = &models.User{ID: 42, Username: "mybot"}
+
+	base := models.Message{
+		Date:         int(time.Now().Unix()),
+		From:         &models.User{ID: 7, Username: "alice"},
+		MediaGroupID: "album-1",
+		Chat: models.Chat{
+			ID:   100,
+			Type: models.ChatTypePrivate,
+		},
+	}
+	second := base
+	second.ID = 11
+	second.Photo = []models.PhotoSize{{FileID: "photo-2"}}
+	first := base
+	first.ID = 10
+	first.Caption = "compare these screenshots"
+	first.Photo = []models.PhotoSize{{FileID: "photo-1"}}
+
+	// Telegram album updates do not have to be delivered in message-id order.
+	p.handleMessage(context.Background(), &second)
+	p.handleMessage(context.Background(), &first)
+
+	select {
+	case got := <-handled:
+		if got.Content != "compare these screenshots" {
+			t.Fatalf("Content = %q, want album caption", got.Content)
+		}
+		if len(got.Images) != 2 {
+			t.Fatalf("Images len = %d, want 2", len(got.Images))
+		}
+		if got.Images[0].FileName != "telegram_album_10.jpg" || got.Images[1].FileName != "telegram_album_11.jpg" {
+			t.Fatalf("image order = [%q, %q], want message-id order", got.Images[0].FileName, got.Images[1].FileName)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("album was not handled")
+	}
+
+	select {
+	case got := <-handled:
+		t.Fatalf("album dispatched more than once: %#v", got)
+	case <-time.After(60 * time.Millisecond):
+	}
+
+	if got := stubBot.GetFileCallCount(); got != 2 {
+		t.Fatalf("GetFile calls = %d, want 2", got)
+	}
+}
+
+func TestDownloadFileRetriesTransientHTTPFailures(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) < 3 {
+			http.Error(w, "temporary", http.StatusBadGateway)
+			return
+		}
+		fmt.Fprint(w, "image-data")
+	}))
+	defer server.Close()
+
+	stubBot := newStubTelegramBot()
+	stubBot.fileURL = server.URL + "/file"
+	p := &Platform{token: "token", httpClient: server.Client()}
+	p.bot = stubBot
+
+	data, err := p.downloadFile("photo")
+	if err != nil {
+		t.Fatalf("downloadFile: %v", err)
+	}
+	if string(data) != "image-data" {
+		t.Fatalf("data = %q, want image-data", string(data))
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("HTTP requests = %d, want 3", got)
+	}
+}
+
 func newTelegramTestPlatform(t *testing.T, handler func(http.ResponseWriter, *http.Request)) *Platform {
 	t.Helper()
 
@@ -1035,4 +1238,3 @@ func TestProgressStyleProviderInterface(t *testing.T) {
 		t.Fatalf("ProgressStyle() = %q, want compact", got)
 	}
 }
-
