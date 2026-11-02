@@ -1541,6 +1541,27 @@ func (e *Engine) ExecuteCronJob(job *CronJob) error {
 		return e.executeCronShell(effectivePlatform, replyCtx, job)
 	}
 
+	// Local patch: "/rollover_agy_ask" asks the owner whether to cancel the next
+	// scheduled rollover, using inline buttons instead of an agent turn.
+	if isCronAgyRolloverAskPrompt(job.Prompt) {
+		e.sendAgyRolloverAsk(effectivePlatform, replyCtx)
+		return nil
+	}
+
+	// Local patch: a cron prompt of exactly "/rollover_agy" (or its "/rollover" alias)
+	// runs the built-in Antigravity rollover, as if the owner typed it in the chat.
+	if isCronAgyRolloverPrompt(job.Prompt) {
+		e.cmdAgyRollover(effectivePlatform, &Message{
+			SessionKey: sessionKey,
+			Platform:   platformName,
+			UserID:     "cron",
+			UserName:   "cron",
+			Content:    strings.TrimSpace(job.Prompt),
+			ReplyCtx:   replyCtx,
+		})
+		return nil
+	}
+
 	content := job.Prompt
 	if strings.HasPrefix(content, "/") {
 		parts := strings.Fields(content)

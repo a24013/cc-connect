@@ -183,3 +183,89 @@ func TestAntigravityRolloverTimeoutNeverUsesGlobalTwoHourTimeout(t *testing.T) {
 		t.Fatalf("rollover timeout = %v, want 3m", got)
 	}
 }
+
+func TestIsCronAgyRolloverPrompt(t *testing.T) {
+	for _, prompt := range []string{"/rollover_agy", " /ROLLOVER_AGY\n", "/rollover"} {
+		if !isCronAgyRolloverPrompt(prompt) {
+			t.Fatalf("isCronAgyRolloverPrompt(%q) = false, want true", prompt)
+		}
+	}
+	for _, prompt := range []string{"", "rollover_agy", "/rollover_agy now", "please /rollover_agy", "/help"} {
+		if isCronAgyRolloverPrompt(prompt) {
+			t.Fatalf("isCronAgyRolloverPrompt(%q) = true, want false", prompt)
+		}
+	}
+}
+
+func TestExecuteCronJob_RolloverPromptRunsBuiltinCommand(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewCronStore() error = %v", err)
+	}
+	platform := &stubCronReplyTargetPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "discord"},
+	}
+	agent := &resultAgent{session: newResultAgentSession("should not run as a prompt")}
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	defer e.cancel()
+	e.cronScheduler = NewCronScheduler(store)
+
+	job := &CronJob{
+		ID:          "rollover-job",
+		SessionKey:  "discord:channel-1:user-1",
+		Prompt:      "/rollover_agy",
+		Description: "Weekly rollover",
+	}
+	if err := store.Add(job); err != nil {
+		t.Fatalf("store.Add() error = %v", err)
+	}
+	if err := e.ExecuteCronJob(job); err != nil {
+		t.Fatalf("ExecuteCronJob() error = %v", err)
+	}
+
+	sent := platform.getSent()
+	if len(sent) != 2 {
+		t.Fatalf("sent messages = %v, want cron notice and rollover reply", sent)
+	}
+	if sent[1] != "這個指令只支援 Antigravity。" {
+		t.Fatalf("sent[1] = %q, want the built-in rollover command reply", sent[1])
+	}
+}
+
+func TestExecuteCronJob_RolloverAskPromptSendsChoice(t *testing.T) {
+	store, err := NewCronStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewCronStore() error = %v", err)
+	}
+	platform := &stubCronReplyTargetPlatform{
+		stubPlatformEngine: stubPlatformEngine{n: "discord"},
+	}
+	agent := &resultAgent{session: newResultAgentSession("should not run as a prompt")}
+	e := NewEngine("test", agent, []Platform{platform}, "", LangEnglish)
+	defer e.cancel()
+	e.cronScheduler = NewCronScheduler(store)
+
+	job := &CronJob{
+		ID:          "rollover-ask",
+		SessionKey:  "discord:channel-1:user-1",
+		Prompt:      "/rollover_agy_ask",
+		Description: "Ask about rollover",
+	}
+	if err := store.Add(job); err != nil {
+		t.Fatalf("store.Add() error = %v", err)
+	}
+	if err := e.ExecuteCronJob(job); err != nil {
+		t.Fatalf("ExecuteCronJob() error = %v", err)
+	}
+
+	sent := platform.getSent()
+	if len(sent) != 2 {
+		t.Fatalf("sent messages = %v, want cron notice and rollover choice", sent)
+	}
+	if !strings.Contains(sent[1], "/rollover_skip") || !strings.Contains(sent[1], "/rollover_keep") {
+		t.Fatalf("sent[1] = %q, want skip and keep choices", sent[1])
+	}
+	if isCronAgyRolloverAskPrompt("/rollover_agy") || !isCronAgyRolloverAskPrompt(" /ROLLOVER_AGY_ASK ") {
+		t.Fatal("isCronAgyRolloverAskPrompt matched the wrong prompts")
+	}
+}

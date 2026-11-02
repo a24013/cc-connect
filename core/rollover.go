@@ -367,3 +367,35 @@ func (e *Engine) maybeSendRolloverReminder(p Platform, replyCtx any, agent Agent
 	}
 	e.send(p, replyCtx, msg)
 }
+
+// isCronAgyRolloverPrompt reports whether a cron prompt asks only for the
+// built-in Antigravity rollover command.
+func isCronAgyRolloverPrompt(prompt string) bool {
+	switch strings.ToLower(strings.TrimSpace(prompt)) {
+	case "/rollover_agy", "/rollover":
+		return true
+	}
+	return false
+}
+
+// isCronAgyRolloverAskPrompt reports whether a cron prompt asks the owner
+// whether to cancel the next scheduled rollover.
+func isCronAgyRolloverAskPrompt(prompt string) bool {
+	return strings.EqualFold(strings.TrimSpace(prompt), "/rollover_agy_ask")
+}
+
+const agyRolloverAskText = "明天（週日）04:30 會幫叢雨換 session。要取消這次換線嗎？\n沒有回答就照常換線。"
+
+// sendAgyRolloverAsk offers the skip/keep choice as inline buttons. The buttons
+// run the owner's custom commands /rollover_skip and /rollover_keep.
+func (e *Engine) sendAgyRolloverAsk(p Platform, replyCtx any) {
+	buttons := [][]ButtonOption{{
+		{Text: "取消這次換線", Data: "cmd:/rollover_skip"},
+		{Text: "照常換線", Data: "cmd:/rollover_keep"},
+	}}
+	if _, ok := p.(InlineButtonSender); ok {
+		e.replyWithButtons(p, replyCtx, agyRolloverAskText, buttons)
+		return
+	}
+	e.reply(p, replyCtx, agyRolloverAskText+"\n取消：/rollover_skip　照常：/rollover_keep")
+}
