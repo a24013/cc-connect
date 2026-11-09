@@ -1032,7 +1032,7 @@ func (p *Platform) handleCallbackQuery(ctx context.Context, cb *models.CallbackQ
 		if _, err := bot.EditMessageText(ctx, &tgbot.EditMessageTextParams{
 			ChatID:      chatID,
 			MessageID:   msgID,
-			Text:        origText + "\n\n> " + command,
+			Text:        origText + "\n\n> " + callbackButtonLabel(msg, data, command),
 			ReplyMarkup: emptyMarkup,
 		}); err != nil {
 			slog.Debug("telegram: callback edit failed", "error", err)
@@ -2037,3 +2037,19 @@ func sanitizeTelegramCommand(cmd string) string {
 }
 
 var _ core.AudioSender = (*Platform)(nil)
+
+// callbackButtonLabel returns the text of the tapped button so the edited
+// message reads "> 喝了 250ml" instead of the raw "> /remind_act …" command.
+func callbackButtonLabel(msg *models.Message, data, fallback string) string {
+	if msg == nil || msg.ReplyMarkup == nil {
+		return fallback
+	}
+	for _, row := range msg.ReplyMarkup.InlineKeyboard {
+		for _, button := range row {
+			if button.CallbackData == data && button.Text != "" {
+				return button.Text
+			}
+		}
+	}
+	return fallback
+}

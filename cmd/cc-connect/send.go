@@ -149,6 +149,14 @@ func parseSendArgs(args []string) (core.SendRequest, string, error) {
 			}
 		case "--at-all":
 			req.AtAll = true
+		case "--buttons":
+			if i+1 >= len(args) {
+				return req, "", fmt.Errorf("--buttons requires a JSON value")
+			}
+			i++
+			if err := json.Unmarshal([]byte(args[i]), &req.Buttons); err != nil {
+				return req, "", fmt.Errorf("--buttons must be JSON rows of {\"text\",\"data\"}: %w", err)
+			}
 		case "--data-dir":
 			if i+1 >= len(args) {
 				return req, "", fmt.Errorf("--data-dir requires a value")
@@ -380,6 +388,7 @@ Options:
       --audio <path>       Send an audio attachment (repeatable)
       --video <path>       Send a video attachment (repeatable)
       --stdin              Read message from stdin (best for long/special-char messages)
+      --buttons <json>     Inline buttons: [[{"text":"OK","data":"cmd:/ok"}]] (Telegram)
       --at-users <ids>     @ user IDs, comma-separated (DingTalk)
       --at-all             @ everyone (DingTalk)
   -p, --project <name>     Target project (optional if only one project)

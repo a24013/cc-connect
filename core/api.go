@@ -60,6 +60,9 @@ type SendRequest struct {
 	Videos     []FileAttachment  `json:"videos,omitempty"`
 	AtUsers    []string          `json:"at_users,omitempty"`
 	AtAll      bool              `json:"at_all,omitempty"`
+	// Buttons attaches inline buttons (rows of {text, data}) to Message on
+	// platforms that implement InlineButtonSender; others get plain text.
+	Buttons [][]ButtonOption `json:"buttons,omitempty"`
 }
 
 // NewAPIServer creates an API server on a Unix socket.
@@ -221,6 +224,10 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "message, tts_text, or attachment is required", http.StatusBadRequest)
 		return
 	}
+	if err := validateSendButtons(req.Message, req.Buttons); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
 
 	s.mu.RLock()
 	var engine *Engine
@@ -253,7 +260,7 @@ func (s *APIServer) handleSend(w http.ResponseWriter, r *http.Request) {
 		workDir = req.CWD
 	}
 	if req.Message != "" || len(req.Images) > 0 || len(req.Files) > 0 {
-		if err := engine.SendToSessionWithOptions(req.SessionKey, req.Message, req.Images, req.Files, SendOptions{WorkDir: workDir, AtUsers: req.AtUsers, AtAll: req.AtAll}); err != nil {
+		if err := engine.SendToSessionWithOptions(req.SessionKey, req.Message, req.Images, req.Files, SendOptions{WorkDir: workDir, AtUsers: req.AtUsers, AtAll: req.AtAll, Buttons: req.Buttons}); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -830,4 +837,29 @@ func (s *APIServer) handleRelayBinding(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	apiJSON(w, http.StatusOK, binding)
+}
+
+// validateSendButtons rejects button payloads Telegram would refuse, so the
+// caller gets a 400 instead of a silently dropped message.
+func validateSendButtons(message string, rows [][]ButtonOption) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("buttons require a text message")
+	}
+	for _, row := range rows {
+		if len(row) == 0 {
+			return fmt.Errorf("button rows must not be empty")
+		}
+		for _, button := range row {
+			if strings.TrimSpace(button.Text) == "" || button.Data == "" {
+				return fmt.Errorf("each button needs text and data")
+			}
+			if len(button.Data) > 64 {
+				return fmt.Errorf("button data %q exceeds 64 bytes", button.Data)
+			}
+		}
+	}
+	return nil
 }

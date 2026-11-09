@@ -383,3 +383,16 @@ func TestBuildSendPayload_JSONRoundTrip(t *testing.T) {
 		t.Fatalf("decoded files = %#v", decoded.Files)
 	}
 }
+
+func TestParseSendArgs_Buttons(t *testing.T) {
+	req, _, err := parseSendArgs([]string{"-m", "hi", "--buttons", `[[{"text":"喝了","data":"cmd:/remind_act a 0"}],[{"text":"稍後","data":"cmd:/remind_act a snooze"}]]`})
+	if err != nil {
+		t.Fatalf("parseSendArgs returned error: %v", err)
+	}
+	if len(req.Buttons) != 2 || req.Buttons[0][0].Text != "喝了" || req.Buttons[1][0].Data != "cmd:/remind_act a snooze" {
+		t.Fatalf("buttons = %#v", req.Buttons)
+	}
+	if _, _, err := parseSendArgs([]string{"-m", "hi", "--buttons", "not-json"}); err == nil {
+		t.Fatal("invalid --buttons JSON should fail")
+	}
+}

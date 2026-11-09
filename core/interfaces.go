@@ -330,8 +330,8 @@ type ProgressUpdateThrottler interface {
 
 // ButtonOption represents a clickable inline button.
 type ButtonOption struct {
-	Text string // display text on the button
-	Data string // callback data returned when clicked (≤64 bytes for Telegram)
+	Text string `json:"text"` // display text on the button
+	Data string `json:"data"` // callback data returned when clicked (≤64 bytes for Telegram)
 }
 
 // InlineButtonSender is an optional interface for platforms that support

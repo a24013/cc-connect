@@ -11010,6 +11010,7 @@ type SendOptions struct {
 	WorkDir string
 	AtUsers []string
 	AtAll   bool
+	Buttons [][]ButtonOption
 }
 
 func (e *Engine) SendToSessionWithAttachments(sessionKey, message string, images []ImageAttachment, files []FileAttachment, atUsers []string, atAll bool) error {
@@ -11072,7 +11073,14 @@ func (e *Engine) SendToSessionWithOptions(sessionKey, message string, images []I
 					return err
 				}
 			}
+		} else if buttonSender, ok := p.(InlineButtonSender); ok && len(opts.Buttons) > 0 {
+			if err := buttonSender.SendWithButtons(e.ctx, replyCtx, message, opts.Buttons); err != nil {
+				return err
+			}
 		} else {
+			if len(opts.Buttons) > 0 {
+				slog.Warn("send: platform has no inline buttons, sending text only", "platform", p.Name())
+			}
 			if err := p.Send(e.ctx, replyCtx, message); err != nil {
 				return err
 			}
